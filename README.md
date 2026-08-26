@@ -1,0 +1,88 @@
+# FormSight
+
+FormSight is a private Chinese/English questionnaire scanner for Windows model PCs. A FastAPI service stores durable jobs and audit data, a single GPU worker runs Qwen through LM Studio and a custom YOLO mark detector, and a bilingual React interface lets operators confirm page groups and reviewers approve every model correction.
+
+Questionnaire text and images are untrusted data. The model gateway explicitly refuses document-borne instructions, disables tool use, and accepts only schema-validated JSON. LM Studio stays on `127.0.0.1`; browsers only connect to the HTTPS web application.
+
+## What is implemented
+
+- Named `admin`, `operator`, and `reviewer` accounts with Argon2id passwords, secure server sessions, CSRF protection, throttled login, ownership checks, and audit events.
+- PDF, PNG, JPEG, and TIFF validation, password-protected PDF rejection, page previews, automatic participant-ID grouping, and mandatory manual group confirmation.
+- Durable SQLite/WAL queue with one GPU worker, progress events, retry, cancel, restart recovery, and 30-day PII purge.
+- Two-pass Qwen3-VL extraction, v14-compatible image enhancement/tiling when the original source is present, optional custom YOLO detection, deterministic fusion, cropped conflict tie-breaks, and a separate Qwen reasonableness stage.
+- Immutable scanner values, clearly separated Qwen/YOLO/fused/judge/final values, reviewer accept/edit/revert actions, and gated finalization.
+- ResultV2 JSON, backward-oriented Excel sheets, Reasonableness and Review_Audit sheets, and annotated evidence PDFs in draft and final variants.
+- Admin pages for health, users, approved model profiles, safe validation rules, and a browser annotation workspace.
+- Versioned YOLO dataset export, leakage checks, training/export tooling, and release-metric evaluation.
+
+## Windows 10 quick start
+
+1. On the GPU server, clone this repository and enter it:
+
+   ```powershell
+   git clone https://github.com/Nickwong-kyoaka/Ai_PDF_to_Excel_APP.git FormSight
+   Set-Location FormSight
+   ```
+
+2. Install Python 3.11+, Node.js 22.13+, an NVIDIA driver, LM Studio 0.4+, and optionally Caddy.
+3. Run `powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -WithML` for the complete YOLO runtime, or omit `-WithML` while developing without detector weights.
+4. Edit `backend\.env`: change the bootstrap password before LAN use, add the LM Studio API token, and verify all model IDs.
+5. In LM Studio, download/load the approved Qwen vision and judge models, require API-token authentication, bind only to `127.0.0.1:1234`, and leave CORS/MCP/tool access disabled.
+6. Put accepted custom weights at `backend\models\questionnaire_marks.onnx`.
+7. Run `scripts\preflight.ps1`, then `scripts\start.ps1`.
+8. For LAN/VPN HTTPS, copy `Caddyfile.example` to `Caddyfile`, replace `formsight.internal` with the internal DNS name, run Caddy as the proxy, and trust its internal CA on managed client PCs.
+
+The development UI uses `http://localhost:3000` and the API uses `http://127.0.0.1:8000`. Production users should use only the HTTPS proxy address.
+
+Only the GPU server needs Python, CUDA/YOLO, and LM Studio. Other LAN/VPN PCs use FormSight entirely through a browser and must not connect directly to ports 1234, 3000, or 8000.
+
+## Models and profiles
+
+The default profile targets an RTX 5060 Ti with 16 GB VRAM and 32 GB RAM:
+
+- extractor: `qwen/qwen3-vl-8b`, Q4_K_M, 32k context;
+- reasonableness judge: `qwen/qwen3-8b`, Q4_K_M;
+- verification: Maximum Accuracy, one active job.
+
+Model IDs vary between LM Studio revisions. `scripts\model-check.ps1` lists missing IDs, and an administrator may register approved alternatives. A profile is snapshotted onto every job and cannot change while that job is processing. Larger A100/multi-GPU profiles can be added without changing scanner code.
+
+The original `universal_questionnaire_lmstudio_extractor_v14_consensus_geometry.py` is bundled as a compatibility source configured by `FORMSIGHT_LEGACY_V14_PATH`. Safe enhancement and zoom helpers are reused when found; the server remains operational if an administrator intentionally removes it.
+
+## YOLO data and release process
+
+1. Upload representative English and Chinese questionnaires and use **Annotations** to draw tight boxes around `tick`, `cross`, `filled_mark`, `circle`, `underline_selection`, and `strikeout` marks.
+2. Assign every participant/document to exactly one of train, validation, or held-out test. The exporter blocks cross-split source leakage.
+3. From the project root, run:
+
+   ```powershell
+   backend\.venv\Scripts\python.exe tools\export_yolo_dataset.py datasets\marks-v1
+   backend\.venv\Scripts\python.exe tools\train_yolo.py datasets\marks-v1\dataset.yaml
+   ```
+
+4. A mark class is experimental until it has at least 50 real held-out examples and reaches at least 95% precision and recall.
+5. Build normalized gold ResultV2 JSON and compare the candidate with v14:
+
+   ```powershell
+   backend\.venv\Scripts\python.exe tools\evaluate_release.py candidate.json gold.json --baseline v14.json
+   ```
+
+The evaluator blocks release below 97% selection exact accuracy, 90% character accuracy, 98% automatic-correction precision when corrections exist, or a two-point selection improvement over v14.
+
+## Operations
+
+- `scripts\status.ps1`: process and endpoint status.
+- `scripts\stop.ps1`: safely stops only processes recorded for this installation.
+- `scripts\backup.ps1`: uses SQLite's online backup API; questionnaire files are intentionally excluded unless your approved PII backup policy includes them.
+- `scripts\cleanup.ps1`: performs the 30-day purge immediately.
+- `scripts\register-startup.ps1`: registers server startup and daily retention tasks; run from an elevated PowerShell session.
+- API documentation: `/docs` on the backend address.
+
+## Development validation
+
+```powershell
+backend\.venv\Scripts\python.exe -m pytest backend\tests
+npm run lint
+npm run build
+```
+
+Custom YOLO weights and real LM Studio models are deployment artifacts, not source-controlled files. Accuracy thresholds cannot be claimed until the held-out corpus satisfies the minimum counts and release evaluator.

@@ -1,0 +1,19 @@
+formsight.internal {
+    tls internal
+    encode zstd gzip
+
+    handle /api/* {
+        reverse_proxy 127.0.0.1:8000
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:3000
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "same-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
+}

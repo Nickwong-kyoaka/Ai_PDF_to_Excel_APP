@@ -31,4 +31,4 @@ try {
 
 New-Item -ItemType Directory -Force -Path (Join-Path $Backend "models"), (Join-Path $Root "runtime") | Out-Null
 
-Write-Host "Installation complete. Edit backend\.env, change the bootstrap password, add the LM Studio token, then run scripts\preflight.ps1."
+Write-Host "Installation complete. Run scripts\preflight.ps1 after configuration, or use Deploy-FormSight.bat for guided deployment."

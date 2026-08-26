@@ -73,7 +73,7 @@ class QuestionnaireExtractor:
     def __init__(self, settings: Settings, profile: dict[str, Any], yolo_weights: Path | None = None):
         self.settings = settings
         self.profile = profile
-        self.gateway = LMStudioGateway(settings.lmstudio_base_url, settings.lmstudio_api_key)
+        self.gateway = LMStudioGateway(settings.lmstudio_base_url, settings.lmstudio_token)
         self.yolo = YoloMarkDetector(yolo_weights or settings.yolo_weights)
         self.legacy = V14Compatibility(settings.legacy_v14_path)
 

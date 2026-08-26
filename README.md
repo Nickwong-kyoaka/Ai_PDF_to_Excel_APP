@@ -17,6 +17,14 @@ Questionnaire text and images are untrusted data. The model gateway explicitly r
 
 ## Windows 10 quick start
 
+### Recommended: one-click wizard
+
+After cloning or extracting the repository on the GPU server, double-click `Deploy-FormSight.bat`. The wizard checks Python, Node.js, NVIDIA tooling, and Caddy; securely prompts for the administrator password and LM Studio token; asks for model IDs, hostname, and YOLO weights; writes the local configuration; installs dependencies; runs preflight checks; starts FormSight; and can register automatic startup and retention cleanup.
+
+Install Python 3.11+, Node.js 22.13+, the tested NVIDIA driver, LM Studio 0.4+, and Caddy before running the wizard. LM Studio model files and accepted YOLO weights remain external deployment artifacts because they are too large and hardware-specific for Git.
+
+### Manual installation
+
 1. On the GPU server, clone this repository and enter it:
 
    ```powershell

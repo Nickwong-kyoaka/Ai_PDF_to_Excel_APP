@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from functools import lru_cache
 from pathlib import Path
 
@@ -21,8 +22,13 @@ class Settings(BaseSettings):
     session_hours: int = 12
     bootstrap_admin_email: str = "admin@formsight.local"
     bootstrap_admin_password: str = "Change-this-before-LAN-use"
+    bootstrap_admin_password_b64: str = ""
     lmstudio_base_url: str = "http://127.0.0.1:1234/v1"
     lmstudio_api_key: str = ""
+    lmstudio_api_key_b64: str = ""
+    extractor_model_id: str = "qwen/qwen3-vl-8b"
+    judge_model_id: str = "qwen/qwen3-8b"
+    model_quantization: str = "Q4_K_M"
     legacy_v14_path: Path = Path(
         "../universal_questionnaire_lmstudio_extractor_v14_consensus_geometry.py"
     )
@@ -55,6 +61,23 @@ class Settings(BaseSettings):
     @property
     def annotations_dir(self) -> Path:
         return self.data_dir / "annotations"
+
+    @staticmethod
+    def _decode_secret(encoded: str, fallback: str) -> str:
+        if not encoded:
+            return fallback
+        try:
+            return base64.b64decode(encoded, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError("Invalid base64-encoded FormSight secret") from exc
+
+    @property
+    def effective_admin_password(self) -> str:
+        return self._decode_secret(self.bootstrap_admin_password_b64, self.bootstrap_admin_password)
+
+    @property
+    def lmstudio_token(self) -> str:
+        return self._decode_secret(self.lmstudio_api_key_b64, self.lmstudio_api_key)
 
     def ensure_directories(self) -> None:
         for path in (

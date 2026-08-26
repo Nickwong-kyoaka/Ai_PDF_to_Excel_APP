@@ -61,10 +61,11 @@ def health():
 @router.get("/system/preflight")
 def preflight(_admin=Depends(require_roles("admin"))):
     disk = shutil.disk_usage(settings.data_dir)
-    lmstudio = LMStudioGateway(settings.lmstudio_base_url, settings.lmstudio_api_key).health()
+    lmstudio = LMStudioGateway(settings.lmstudio_base_url, settings.lmstudio_token).health()
     yolo = YoloMarkDetector(settings.yolo_weights).health()
     loopback = "127.0.0.1" in settings.lmstudio_base_url or "localhost" in settings.lmstudio_base_url
-    security_ready = loopback and bool(settings.lmstudio_api_key) and settings.cookie_secure and not settings.bootstrap_admin_password.startswith("Change-")
+    admin_password = settings.effective_admin_password
+    security_ready = loopback and bool(settings.lmstudio_token) and settings.cookie_secure and not admin_password.startswith("Change-")
     return {
         "status": "ready" if lmstudio["status"] == "online" and yolo["status"] == "online" and security_ready else "attention_required",
         "platform": {"system": platform.system(), "release": platform.release(), "machine": platform.machine()},
@@ -76,5 +77,5 @@ def preflight(_admin=Depends(require_roles("admin"))):
         "lmstudio": lmstudio,
         "yolo": yolo,
         "worker": worker_health(),
-        "security": {"lmstudio_loopback": loopback, "api_token_configured": bool(settings.lmstudio_api_key), "cookie_secure": settings.cookie_secure, "bootstrap_password_changed": not settings.bootstrap_admin_password.startswith("Change-")},
+        "security": {"lmstudio_loopback": loopback, "api_token_configured": bool(settings.lmstudio_token), "cookie_secure": settings.cookie_secure, "bootstrap_password_changed": not admin_password.startswith("Change-")},
     }

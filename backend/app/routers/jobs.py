@@ -135,7 +135,7 @@ async def create_job(
         try:
             group_proposals = visual_grouping(
                 info.page_images,
-                LMStudioGateway(settings.lmstudio_base_url, settings.lmstudio_api_key),
+                LMStudioGateway(settings.lmstudio_base_url, settings.lmstudio_token),
                 profile.extractor_model_id,
             )
         except Exception:

@@ -30,9 +30,15 @@ def bootstrap_defaults(db: Session, settings: Settings) -> None:
                 email=normalize_email(settings.bootstrap_admin_email),
                 display_name="FormSight Administrator",
                 role="admin",
-                password_hash=hash_password(settings.bootstrap_admin_password),
+                password_hash=hash_password(settings.effective_admin_password),
             )
         )
     if not db.scalar(select(ModelProfile.id).limit(1)):
-        db.add(ModelProfile(**DEFAULT_PROFILE))
+        profile = {
+            **DEFAULT_PROFILE,
+            "extractor_model_id": settings.extractor_model_id,
+            "judge_model_id": settings.judge_model_id,
+            "quantization": settings.model_quantization,
+        }
+        db.add(ModelProfile(**profile))
     db.commit()

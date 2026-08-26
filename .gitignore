@@ -223,6 +223,7 @@ __marimo__/
 /backups/
 /outputs/
 /work/
+/Caddyfile
 
 # Keep configuration templates, never real environment files
 .env*

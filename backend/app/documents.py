@@ -66,6 +66,8 @@ def inspect_and_render(
 
     try:
         image = Image.open(source)
+        if suffix in {".tif", ".tiff"} and int(getattr(image, "n_frames", 1)) != 1:
+            raise ValueError("Multi-page TIFF files are not supported; convert them to PDF first")
         image.seek(0)
         image = ImageOps.exif_transpose(image).convert("RGB")
         image.thumbnail((1800, 1800), Image.Resampling.LANCZOS)

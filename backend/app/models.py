@@ -239,3 +239,48 @@ class YoloModel(Base):
     classes: Mapped[list[str]] = mapped_column(JSON, default=list)
     active: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class LocalBatch(Base):
+    __tablename__ = "local_batches"
+    __table_args__ = (Index("idx_local_batches_status_created", "status", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    status: Mapped[str] = mapped_column(String(40), default="preparing", nullable=False)
+    output_path: Mapped[str] = mapped_column(Text, nullable=False)
+    review_groups: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    lmstudio_base_url: Mapped[str] = mapped_column(String(255), nullable=False)
+    extractor_model_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    judge_model_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    progress: Mapped[float] = mapped_column(Float, default=0.0)
+    stage_message: Mapped[str] = mapped_column(String(255), default="Preparing files")
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    items: Mapped[list["LocalBatchItem"]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan", order_by="LocalBatchItem.order_index"
+    )
+
+
+class LocalBatchItem(Base):
+    __tablename__ = "local_batch_items"
+    __table_args__ = (Index("idx_local_batch_items_order", "batch_id", "order_index", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("local_batches.id", ondelete="CASCADE"), nullable=False)
+    job_id: Mapped[str | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"))
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    original_path: Mapped[str] = mapped_column(Text, nullable=False)
+    stored_path: Mapped[str] = mapped_column(Text, nullable=False)
+    output_path: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(40), default="pending", nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    batch: Mapped[LocalBatch] = relationship(back_populates="items")
+    job: Mapped[Job | None] = relationship()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import pymupdf as fitz
@@ -70,12 +71,28 @@ def sanitize_item(item: dict[str, Any], fallback_id: str) -> dict[str, Any]:
 
 
 class QuestionnaireExtractor:
-    def __init__(self, settings: Settings, profile: dict[str, Any], yolo_weights: Path | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        profile: dict[str, Any],
+        yolo_weights: Path | None = None,
+        *,
+        manage_models: bool = True,
+        progress_callback: Callable[[str, float, str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ):
         self.settings = settings
         self.profile = profile
         self.gateway = LMStudioGateway(settings.lmstudio_base_url, settings.lmstudio_token)
         self.yolo = YoloMarkDetector(yolo_weights or settings.yolo_weights)
         self.legacy = V14Compatibility(settings.legacy_v14_path)
+        self.manage_models = manage_models
+        self.progress_callback = progress_callback
+        self.cancel_check = cancel_check
+
+    def notify(self, stage: str, progress: float, message: str) -> None:
+        if self.progress_callback:
+            self.progress_callback(stage, max(0.0, min(1.0, progress)), message)
 
     def orient(self, image: Image.Image) -> Image.Image:
         try:
@@ -172,7 +189,8 @@ class QuestionnaireExtractor:
         }
 
     def extract_job(self, db: Session, job: Job) -> None:
-        self.gateway.manage_model("load", self.profile["extractor_model_id"])
+        if self.manage_models:
+            self.gateway.manage_model("load", self.profile["extractor_model_id"])
         db.execute(delete(Answer).where(Answer.job_id == job.id))
         db.commit()
         source = Path(job.stored_path)
@@ -191,13 +209,14 @@ class QuestionnaireExtractor:
         for group in groups:
             for page_number in range(group.start_page, group.end_page + 1):
                 db.refresh(job)
-                if job.cancel_requested:
+                if job.cancel_requested or (self.cancel_check and self.cancel_check()):
                     job.status = "cancelled"
                     job.stage_message = "Cancelled by user"
                     db.commit()
                     return
                 job.stage_message = f"Extracting page {page_number} of {job.page_count}"
                 job.progress = (processed / max(1, total_work_pages)) * 0.72
+                self.notify("extracting", job.progress, job.stage_message)
                 db.commit()
 
                 try:
@@ -260,7 +279,7 @@ class QuestionnaireExtractor:
 
     def judge_job(self, db: Session, job: Job) -> None:
         self.yolo.release()
-        if self.profile["judge_model_id"] != self.profile["extractor_model_id"]:
+        if self.manage_models and self.profile["judge_model_id"] != self.profile["extractor_model_id"]:
             self.gateway.manage_model("unload", self.profile["extractor_model_id"])
             self.gateway.manage_model("load", self.profile["judge_model_id"])
         job.status = "judging"
@@ -272,6 +291,12 @@ class QuestionnaireExtractor:
             select(QuestionnaireGroup).where(QuestionnaireGroup.job_id == job.id)
         ).all()
         for group_index, group in enumerate(groups):
+            if job.cancel_requested or (self.cancel_check and self.cancel_check()):
+                job.status = "cancelled"
+                job.stage_message = "Cancelled by user"
+                db.commit()
+                return
+            self.notify("judging", job.progress, f"Checking questionnaire {group_index + 1} of {len(groups)}")
             answers = db.scalars(
                 select(Answer).where(Answer.group_id == group.id).order_by(Answer.page_number, Answer.question_id)
             ).all()
@@ -351,6 +376,7 @@ class QuestionnaireExtractor:
                     answer.review_status = "pending"
                     answer.reasonableness_status = "review_required"
             job.progress = 0.76 + ((group_index + 1) / max(1, len(groups))) * 0.14
+            self.notify("judging", job.progress, job.stage_message)
             db.commit()
 
 

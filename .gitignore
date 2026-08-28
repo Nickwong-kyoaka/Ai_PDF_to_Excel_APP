@@ -31,6 +31,7 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!desktop/*.spec
 
 # Installer logs
 pip-log.txt
@@ -214,6 +215,9 @@ __marimo__/
 /out/
 /.wrangler/
 /coverage/
+/release/
+/.desktop-venv/
+/.test-localappdata/
 
 # FormSight local runtime (contains questionnaire PII and model artifacts)
 /backend/.venv/

@@ -1,3 +1,2 @@
 -r requirements.txt
-ultralytics>=8.3,<9
 onnxruntime-gpu>=1.20,<2

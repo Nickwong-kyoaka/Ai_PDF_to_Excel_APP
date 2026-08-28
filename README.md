@@ -2,6 +2,28 @@
 
 FormSight is a private Chinese/English questionnaire scanner for Windows model PCs. A FastAPI service stores durable jobs and audit data, a single GPU worker runs Qwen through LM Studio and a custom YOLO mark detector, and a bilingual React interface lets operators confirm page groups and reviewers approve every model correction.
 
+The repository also contains **FormSight Local**, a separate single-user PySide6 desktop edition. It has no login or web server, never asks for an API URL/token, automatically detects an already-running loopback LM Studio server, accepts multiple questionnaire files, and generates one corresponding Excel workbook for every selected input.
+
+## FormSight Local desktop edition
+
+On the destination Windows 10/11 x64 PC:
+
+1. Install LM Studio 0.4+, start its local server with the default loopback-only/authentication-off settings, and load a Qwen vision model. The preferred model is `qwen/qwen3-vl-8b`; another loaded Qwen3-VL, Qwen2.5-VL, or Qwen vision model is selected automatically.
+2. Run `FormSight-Local-Setup.exe`. Python, Node.js, FastAPI, and an API key are not required on the destination PC.
+3. Launch **FormSight Local**, add any number of PDF/PNG/JPEG/single-page TIFF questionnaires, choose an output folder, optionally review PDF page groups, and start the scan. Each selected file receives a separate `<source-name>_FormSight.xlsx`; multiple questionnaires detected inside the same PDF remain together in that PDF's workbook.
+
+The application uses only models already loaded in LM Studio. It does not download, load, or unload models. A separate loaded Qwen3 8B text model is preferred for the reasonableness check; otherwise the selected vision model is reused. If `questionnaire_marks.onnx` was not accepted and included at build time, the UI clearly reports Qwen-only mode and scanning remains available. Accepted weights can also be added later on the destination PC at `%LOCALAPPDATA%\FormSight Local\models\questionnaire_marks.onnx`.
+
+Local working records and restart state are stored under `%LOCALAPPDATA%\FormSight Local` and expired questionnaire data is purged after 30 days. Every input workbook contains `Questionnaires`, `Long_Answers`, `Page_Extracts`, `Conflicts`, `Failed_Jobs`, `QA_Summary`, `Data_Analysis`, `Run_Log`, `Reasonableness`, and `Review_Audit`. A corrupted or failed input still receives its own failure workbook, successful inputs are not lost, and unresolved findings are labelled `COMPLETED — FLAGS PRESENT`.
+
+To build the installer on a developer PC, install 64-bit Python 3.11 or 3.12 and Inno Setup 6, then double-click `Build-FormSight-Local.bat` or run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-desktop.ps1
+```
+
+The repeatable build creates a PyInstaller one-folder application and wraps it as `release\FormSight-Local-Setup.exe`. Place an accepted detector at `backend\models\questionnaire_marks.onnx` before building to include YOLO; otherwise the installer intentionally ships in Qwen-only mode.
+
 Questionnaire text and images are untrusted data. The model gateway explicitly refuses document-borne instructions, disables tool use, and accepts only schema-validated JSON. LM Studio stays on `127.0.0.1`; browsers only connect to the HTTPS web application.
 
 ## What is implemented

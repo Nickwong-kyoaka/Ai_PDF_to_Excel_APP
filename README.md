@@ -10,7 +10,9 @@ On the destination Windows 10/11 x64 PC:
 
 1. Install LM Studio 0.4+, start its local server with the default loopback-only/authentication-off settings, and load two Q4 vision models: `qwen/qwen3-vl-8b` as the primary and `google/gemma-3-4b` as the independent verifier. For a 16 GB RTX 5060 Ti, use a 16384-token context, enable Flash Attention, and keep the KV cache in system RAM for both.
 2. Run `FormSight-Local-Setup.exe`. Python, Node.js, FastAPI, and an API key are not required on the destination PC.
-3. Launch **FormSight Local**, add any number of PDF/PNG/JPEG/single-page TIFF questionnaires, choose an output folder, optionally review PDF page groups, and start the scan. Each selected file receives a separate `<source-name>_FormSight.xlsx`; multiple questionnaires detected inside the same PDF remain together in that PDF's workbook.
+3. Launch **FormSight Local**, drag in or select any number of PDF/PNG/JPEG/single-page TIFF questionnaires, choose an output folder, optionally review PDF page groups, and start the scan. Each selected file receives a separate `<source-name>_FormSight.xlsx`; multiple questionnaires detected inside the same PDF remain together in that PDF's workbook.
+
+The page-series review works through one PDF at a time and provides one-document, one-page, and fixed-pages-per-questionnaire presets. A validated page-range pattern can be copied to every same-length PDF, participant IDs can be auto-numbered, and live validation prevents gaps or overlapping pages before scanning.
 
 The local application uses only models already loaded in LM Studio and does not download, load, or unload them. It runs the Qwen primary pass and Gemma verifier pass sequentially—never in parallel—then uses Qwen again for cropped conflict adjudication and the reasonableness check. This provides model-family diversity without keeping a third model in memory. YOLO and ONNX Runtime are no longer part of the local installer; the web-server edition retains its separate optional YOLO pipeline.
 
@@ -22,7 +24,7 @@ To build the installer on a developer PC, install 64-bit Python 3.11 or 3.12 and
 powershell -ExecutionPolicy Bypass -File scripts\build-desktop.ps1
 ```
 
-The repeatable build creates a PyInstaller one-folder application and wraps it as `release\FormSight-Local-Setup.exe`. LM Studio remains responsible for GPU inference, so the desktop installer does not bundle model weights, CUDA libraries, or ONNX Runtime.
+The repeatable build creates a PyInstaller one-folder application, wraps it as `release\FormSight-Local-Setup.exe`, and creates a transfer-ready `release\FormSight-Local-v0.3.0-Transfer.zip`. The ZIP contains only the installer, a bilingual quick-start guide, and its SHA-256 checksum. If the installer already exists, `Package-FormSight-Transfer.bat` can rebuild the ZIP without recompiling the app. LM Studio remains responsible for GPU inference, so the desktop installer does not bundle model weights, CUDA libraries, or ONNX Runtime.
 
 Questionnaire text and images are untrusted data. The model gateway explicitly refuses document-borne instructions, disables tool use, and accepts only schema-validated JSON. LM Studio stays on `127.0.0.1`; browsers only connect to the HTTPS web application.
 

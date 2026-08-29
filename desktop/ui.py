@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from backend.app.documents import ProposedGroup, validate_group_partition
 from . import __version__
+from .group_series import build_fixed_size_series, clone_page_pattern, numbered_participant_ids
 from .model_discovery import DiscoveryResult, discover_models
 from .runner import ALLOWED_SUFFIXES, GroupDraft, LocalBatchRunner, RunnerEvent
 from .runtime import DesktopRuntime, create_runtime
@@ -46,6 +47,10 @@ TEXT = {
     "en": {
         "title": "FormSight Local",
         "subtitle": "Batch input → one corresponding Excel workbook per file",
+        "step_models": "1  MODELS",
+        "step_files": "2  FILES",
+        "step_groups": "3  GROUP & OUTPUT",
+        "step_scan": "4  SCAN",
         "language": "介面語言",
         "lm": "LM Studio",
         "yolo": "Sequential consensus",
@@ -74,6 +79,11 @@ TEXT = {
         "type": "Type",
         "path": "Location",
         "status": "Status",
+        "workbook": "Output workbook",
+        "drop_hint": "Drop files or folders anywhere in this window",
+        "file_summary_empty": "No questionnaires added yet",
+        "file_summary": "{count} input file(s) → {count} separate Excel workbook(s)",
+        "output_hint": "Each source file gets its own workbook. PDFs may contain several questionnaire groups.",
         "log": "Run log",
         "select_files": "Select questionnaires",
         "select_folder": "Select a folder",
@@ -85,6 +95,10 @@ TEXT = {
     "zh": {
         "title": "FormSight 本機版",
         "subtitle": "批量輸入 → 每個檔案各自輸出一個 Excel 活頁簿",
+        "step_models": "1  模型",
+        "step_files": "2  檔案",
+        "step_groups": "3  分組及輸出",
+        "step_scan": "4  掃描",
         "language": "Interface language",
         "lm": "LM Studio",
         "yolo": "順序式雙模型共識",
@@ -113,6 +127,11 @@ TEXT = {
         "type": "類型",
         "path": "位置",
         "status": "狀態",
+        "workbook": "輸出活頁簿",
+        "drop_hint": "可將檔案或資料夾拖放到此視窗任何位置",
+        "file_summary_empty": "尚未加入問卷",
+        "file_summary": "{count} 個輸入檔案 → {count} 個獨立 Excel 活頁簿",
+        "output_hint": "每個來源檔案各自輸出活頁簿；同一 PDF 可包含多個問卷分組。",
         "log": "執行記錄",
         "select_files": "選擇問卷",
         "select_folder": "選擇資料夾",
@@ -161,142 +180,343 @@ class BatchThread(QThread):
 class GroupReviewDialog(QDialog):
     def __init__(self, drafts: list[GroupDraft], parent: QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Review page groups / 檢查頁面分組")
-        self.resize(1050, 560)
+        self.setWindowTitle("Questionnaire series / 問卷系列分組")
+        self.resize(1120, 710)
+        self._active_job_id: str | None = None
+        self._job_order: list[str] = []
+        self._source_names: dict[str, str] = {}
+        self._page_counts: dict[str, int] = {}
+        self._groups: dict[str, list[ProposedGroup]] = defaultdict(list)
+        for draft in drafts:
+            if draft.job_id not in self._source_names:
+                self._job_order.append(draft.job_id)
+                self._source_names[draft.job_id] = draft.source_file
+                self._page_counts[draft.job_id] = draft.page_count
+            self._groups[draft.job_id].append(
+                ProposedGroup(
+                    start_page=draft.start_page,
+                    end_page=draft.end_page,
+                    participant_id=draft.participant_id,
+                    confidence=draft.confidence,
+                    reason=draft.reason,
+                )
+            )
+
         layout = QVBoxLayout(self)
+        heading = QLabel("Confirm questionnaire series / 確認問卷系列")
+        heading.setObjectName("dialogTitle")
+        layout.addWidget(heading)
         note = QLabel(
-            "Each PDF page must be covered exactly once. Edit Start/End or Participant ID; "
-            "use Split to create another questionnaire.\n"
-            "每一頁必須恰好屬於一個分組。可修改起始／結束頁及參加者編號，或用「分割」新增問卷。"
+            "Work through one source at a time. Every page must be covered exactly once. "
+            "Use a preset for regular batches, then adjust ranges or IDs if needed.\n"
+            "逐一檢查每個來源；每頁必須恰好出現一次。規則批次可先套用快速分組，再按需要調整頁碼或編號。"
         )
         note.setWordWrap(True)
         layout.addWidget(note)
-        self.table = QTableWidget(0, 8)
+
+        navigator = QFrame()
+        navigator.setObjectName("panel")
+        navigator_layout = QHBoxLayout(navigator)
+        self.previous_button = QPushButton("‹ Previous / 上一個")
+        self.file_combo = QComboBox()
+        self.next_button = QPushButton("Next / 下一個 ›")
+        for index, job_id in enumerate(self._job_order, start=1):
+            self.file_combo.addItem(f"{index}. {self._source_names[job_id]}", job_id)
+        navigator_layout.addWidget(self.previous_button)
+        navigator_layout.addWidget(self.file_combo, 1)
+        navigator_layout.addWidget(self.next_button)
+        layout.addWidget(navigator)
+
+        self.document_summary = QLabel()
+        self.document_summary.setObjectName("seriesSummary")
+        layout.addWidget(self.document_summary)
+
+        preset_frame = QFrame()
+        preset_frame.setObjectName("softPanel")
+        preset_layout = QHBoxLayout(preset_frame)
+        preset_layout.addWidget(QLabel("Quick series / 快速分組:"))
+        self.one_document_button = QPushButton("One questionnaire / 整份一份")
+        self.one_page_button = QPushButton("Each page / 每頁一份")
+        self.pages_per_group = QSpinBox()
+        self.pages_per_group.setRange(1, 9999)
+        self.pages_per_group.setValue(2)
+        self.pages_per_group.setSuffix(" pages / 頁")
+        self.apply_size_button = QPushButton("Apply / 套用")
+        self.copy_pattern_button = QPushButton("Copy to same-length files / 複製至同頁數檔案")
+        for widget in (
+            self.one_document_button,
+            self.one_page_button,
+            self.pages_per_group,
+            self.apply_size_button,
+            self.copy_pattern_button,
+        ):
+            preset_layout.addWidget(widget)
+        preset_layout.addStretch()
+        layout.addWidget(preset_frame)
+
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["File / 檔案", "Group", "Pages", "Start / 起", "End / 迄", "Participant ID", "Confidence", "Reason"]
+            ["Questionnaire / 問卷", "Start / 起", "End / 迄", "Participant ID / 參加者編號", "Confidence", "Reason / 原因"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
-        for draft in drafts:
-            self._append(draft)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table)
 
         controls = QHBoxLayout()
-        split_button = QPushButton("Split selected / 分割所選")
-        merge_button = QPushButton("Merge selected / 合併所選")
-        split_button.clicked.connect(self.split_selected)
-        merge_button.clicked.connect(self.merge_selected)
-        controls.addWidget(split_button)
-        controls.addWidget(merge_button)
+        self.split_button = QPushButton("Split selected / 分割所選")
+        self.merge_button = QPushButton("Merge with next / 與下一組合併")
+        controls.addWidget(self.split_button)
+        controls.addWidget(self.merge_button)
+        controls.addSpacing(20)
+        controls.addWidget(QLabel("Auto IDs / 自動編號:"))
+        self.id_prefix = QLineEdit("ID-")
+        self.id_prefix.setMaximumWidth(110)
+        self.id_start = QSpinBox()
+        self.id_start.setRange(0, 999999)
+        self.id_start.setValue(1)
+        self.fill_ids_button = QPushButton("Fill current file / 填寫目前檔案")
+        controls.addWidget(self.id_prefix)
+        controls.addWidget(self.id_start)
+        controls.addWidget(self.fill_ids_button)
         controls.addStretch()
         layout.addLayout(controls)
+
+        self.validation_label = QLabel()
+        self.validation_label.setObjectName("validation")
+        layout.addWidget(self.validation_label)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Confirm all & scan / 確認全部並掃描")
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _append(self, draft: GroupDraft, row: int | None = None) -> None:
-        row = self.table.rowCount() if row is None else row
-        self.table.insertRow(row)
-        values = [
-            draft.source_file,
-            str(draft.group_index + 1),
-            str(draft.page_count),
-            str(draft.start_page),
-            str(draft.end_page),
-            draft.participant_id or "",
-            f"{draft.confidence:.0%}",
-            draft.reason,
-        ]
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            if column == 0:
-                item.setData(Qt.ItemDataRole.UserRole, draft.job_id)
-                item.setData(Qt.ItemDataRole.UserRole + 1, draft.page_count)
-            if column in {0, 1, 2, 6, 7}:
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.table.setItem(row, column, item)
+        self.file_combo.currentIndexChanged.connect(self._switch_document)
+        self.previous_button.clicked.connect(lambda: self._move_document(-1))
+        self.next_button.clicked.connect(lambda: self._move_document(1))
+        self.one_document_button.clicked.connect(lambda: self._apply_fixed_size(self._active_page_count()))
+        self.one_page_button.clicked.connect(lambda: self._apply_fixed_size(1))
+        self.apply_size_button.clicked.connect(lambda: self._apply_fixed_size(self.pages_per_group.value()))
+        self.copy_pattern_button.clicked.connect(self.copy_pattern)
+        self.split_button.clicked.connect(self.split_selected)
+        self.merge_button.clicked.connect(self.merge_selected)
+        self.fill_ids_button.clicked.connect(self.fill_participant_ids)
+        if self._job_order:
+            self._render_document(self._job_order[0])
+
+    def _active_page_count(self) -> int:
+        return self._page_counts.get(self._active_job_id or "", 1)
+
+    def _spin(self, row: int, column: int) -> QSpinBox:
+        widget = self.table.cellWidget(row, column)
+        if not isinstance(widget, QSpinBox):
+            raise TypeError("Page range control is missing")
+        return widget
+
+    def _participant(self, row: int) -> QLineEdit:
+        widget = self.table.cellWidget(row, 3)
+        if not isinstance(widget, QLineEdit):
+            raise TypeError("Participant ID control is missing")
+        return widget
+
+    def _capture_active(self) -> None:
+        if not self._active_job_id:
+            return
+        current: list[ProposedGroup] = []
+        previous = self._groups.get(self._active_job_id, [])
+        for row in range(self.table.rowCount()):
+            prior = previous[row] if row < len(previous) else None
+            current.append(
+                ProposedGroup(
+                    start_page=self._spin(row, 1).value(),
+                    end_page=self._spin(row, 2).value(),
+                    participant_id=self._participant(row).text().strip() or None,
+                    confidence=prior.confidence if prior else 1.0,
+                    reason=prior.reason if prior else "Edited by operator",
+                )
+            )
+        self._groups[self._active_job_id] = current
+
+    def _render_document(self, job_id: str) -> None:
+        self._active_job_id = job_id
+        page_count = self._page_counts[job_id]
+        groups = self._groups[job_id]
+        self.table.setRowCount(0)
+        for row, group in enumerate(groups):
+            self.table.insertRow(row)
+            number = QTableWidgetItem(str(row + 1))
+            number.setFlags(number.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            number.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 0, number)
+            for column, value in ((1, group.start_page), (2, group.end_page)):
+                spinner = QSpinBox()
+                spinner.setRange(1, page_count)
+                spinner.setValue(value)
+                spinner.valueChanged.connect(self._update_summary)
+                self.table.setCellWidget(row, column, spinner)
+            participant = QLineEdit(group.participant_id or "")
+            participant.setPlaceholderText("Optional / 可留空")
+            self.table.setCellWidget(row, 3, participant)
+            confidence = QTableWidgetItem(f"{group.confidence:.0%}")
+            confidence.setFlags(confidence.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 4, confidence)
+            reason = QTableWidgetItem(group.reason)
+            reason.setFlags(reason.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 5, reason)
+        if groups:
+            self.table.selectRow(0)
+        self._update_summary()
+
+    def _switch_document(self, index: int) -> None:
+        if index < 0:
+            return
+        self._capture_active()
+        job_id = str(self.file_combo.itemData(index))
+        self._render_document(job_id)
+
+    def _move_document(self, offset: int) -> None:
+        target = self.file_combo.currentIndex() + offset
+        if 0 <= target < self.file_combo.count():
+            self.file_combo.setCurrentIndex(target)
+
+    def _apply_fixed_size(self, size: int) -> None:
+        if not self._active_job_id:
+            return
+        self._groups[self._active_job_id] = build_fixed_size_series(self._active_page_count(), size)
+        self._render_document(self._active_job_id)
+
+    def copy_pattern(self) -> None:
+        if not self._active_job_id:
+            return
+        self._capture_active()
+        page_count = self._active_page_count()
+        pattern = self._groups[self._active_job_id]
+        try:
+            validate_group_partition([(group.start_page, group.end_page) for group in pattern], page_count)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid series / 分組無效", str(exc))
+            return
+        copied = 0
+        for job_id in self._job_order:
+            if job_id != self._active_job_id and self._page_counts[job_id] == page_count:
+                self._groups[job_id] = clone_page_pattern(pattern, page_count)
+                copied += 1
+        QMessageBox.information(
+            self,
+            "Pattern copied / 已複製分組",
+            f"Applied to {copied} other same-length file(s).\n已套用至 {copied} 個相同頁數的其他檔案。",
+        )
 
     def split_selected(self) -> None:
         row = self.table.currentRow()
-        if row < 0:
+        if row < 0 or not self._active_job_id:
             return
-        start = int(self.table.item(row, 3).text())
-        end = int(self.table.item(row, 4).text())
+        self._capture_active()
+        groups = self._groups[self._active_job_id]
+        start = groups[row].start_page
+        end = groups[row].end_page
         if start >= end:
-            QMessageBox.information(self, "Cannot split", "Select a group containing at least two pages.")
+            QMessageBox.information(
+                self, "Cannot split / 無法分割", "Select a group containing at least two pages. / 請選擇至少包含兩頁的分組。"
+            )
             return
         middle = (start + end) // 2
-        self.table.item(row, 4).setText(str(middle))
-        first = self.table.item(row, 0)
-        draft = GroupDraft(
-            job_id=str(first.data(Qt.ItemDataRole.UserRole)),
-            source_file=first.text(),
-            page_count=int(first.data(Qt.ItemDataRole.UserRole + 1)),
-            group_index=row + 1,
+        original = groups[row]
+        groups[row] = ProposedGroup(
+            start_page=start,
+            end_page=middle,
+            participant_id=original.participant_id,
+            confidence=1.0,
+            reason="Split by operator",
+        )
+        groups.insert(row + 1, ProposedGroup(
             start_page=middle + 1,
             end_page=end,
             participant_id=None,
             confidence=1.0,
             reason="Split by operator",
-        )
-        self._append(draft, row + 1)
-        self._renumber()
+        ))
+        self._render_document(self._active_job_id)
+        self.table.selectRow(row + 1)
 
     def merge_selected(self) -> None:
         row = self.table.currentRow()
-        if row < 0:
+        if row < 0 or not self._active_job_id:
             return
-        job_id = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
-        neighbor = row - 1 if row > 0 and self.table.item(row - 1, 0).data(Qt.ItemDataRole.UserRole) == job_id else row + 1
-        if neighbor >= self.table.rowCount() or self.table.item(neighbor, 0).data(Qt.ItemDataRole.UserRole) != job_id:
-            QMessageBox.information(self, "Cannot merge", "No adjacent group belongs to the same PDF.")
+        self._capture_active()
+        groups = self._groups[self._active_job_id]
+        if row + 1 >= len(groups):
+            QMessageBox.information(self, "Cannot merge / 無法合併", "Select a group that has a following group. / 請選擇後面仍有分組的一列。")
             return
-        keep, remove = (neighbor, row) if neighbor < row else (row, neighbor)
-        start = min(int(self.table.item(keep, 3).text()), int(self.table.item(remove, 3).text()))
-        end = max(int(self.table.item(keep, 4).text()), int(self.table.item(remove, 4).text()))
-        self.table.item(keep, 3).setText(str(start))
-        self.table.item(keep, 4).setText(str(end))
-        self.table.removeRow(remove)
-        self._renumber()
+        first, second = groups[row], groups[row + 1]
+        groups[row] = ProposedGroup(
+            start_page=min(first.start_page, second.start_page),
+            end_page=max(first.end_page, second.end_page),
+            participant_id=first.participant_id or second.participant_id,
+            confidence=1.0,
+            reason="Merged by operator",
+        )
+        groups.pop(row + 1)
+        self._render_document(self._active_job_id)
+        self.table.selectRow(row)
 
-    def _renumber(self) -> None:
-        counts: defaultdict[str, int] = defaultdict(int)
-        for row in range(self.table.rowCount()):
-            job_id = str(self.table.item(row, 0).data(Qt.ItemDataRole.UserRole))
-            counts[job_id] += 1
-            self.table.item(row, 1).setText(str(counts[job_id]))
+    def fill_participant_ids(self) -> None:
+        if not self._active_job_id:
+            return
+        ids = numbered_participant_ids(self.table.rowCount(), self.id_prefix.text(), self.id_start.value())
+        for row, participant_id in enumerate(ids):
+            self._participant(row).setText(participant_id)
+        self._capture_active()
+
+    def _update_summary(self) -> None:
+        if not self._active_job_id:
+            return
+        source = self._source_names[self._active_job_id]
+        page_count = self._active_page_count()
+        total_files = len(self._job_order)
+        current_file = self._job_order.index(self._active_job_id) + 1
+        self.document_summary.setText(
+            f"File {current_file} of {total_files} · {source} · {page_count} page(s) · "
+            f"{self.table.rowCount()} questionnaire(s)  /  檔案 {current_file}/{total_files} · "
+            f"{page_count} 頁 · {self.table.rowCount()} 份問卷"
+        )
+        try:
+            ranges = [(self._spin(row, 1).value(), self._spin(row, 2).value()) for row in range(self.table.rowCount())]
+            validate_group_partition(ranges, page_count)
+            self.validation_label.setText("● Complete page coverage — ready to confirm / 頁面完整無重疊，可確認")
+            self.validation_label.setStyleSheet("color: #117d65; font-weight: 700;")
+        except (TypeError, ValueError) as exc:
+            self.validation_label.setText(f"● Fix this series: {exc} / 請修正此分組")
+            self.validation_label.setStyleSheet("color: #b42318; font-weight: 700;")
+        index = self.file_combo.currentIndex()
+        self.previous_button.setEnabled(index > 0)
+        self.next_button.setEnabled(index + 1 < self.file_combo.count())
 
     def result_groups(self) -> dict[str, list[ProposedGroup]]:
-        result: dict[str, list[ProposedGroup]] = defaultdict(list)
-        for row in range(self.table.rowCount()):
-            source = self.table.item(row, 0)
-            job_id = str(source.data(Qt.ItemDataRole.UserRole))
-            result[job_id].append(
+        self._capture_active()
+        return {
+            job_id: [
                 ProposedGroup(
-                    start_page=int(self.table.item(row, 3).text()),
-                    end_page=int(self.table.item(row, 4).text()),
-                    participant_id=self.table.item(row, 5).text().strip() or None,
-                    confidence=1.0,
+                    start_page=group.start_page,
+                    end_page=group.end_page,
+                    participant_id=group.participant_id,
+                    confidence=group.confidence,
                     reason="Confirmed in FormSight Local",
                 )
-            )
-        return dict(result)
+                for group in groups
+            ]
+            for job_id, groups in self._groups.items()
+        }
 
     def _validate_and_accept(self) -> None:
         try:
             grouped = self.result_groups()
-            page_counts: dict[str, int] = {}
-            for row in range(self.table.rowCount()):
-                source = self.table.item(row, 0)
-                page_counts[str(source.data(Qt.ItemDataRole.UserRole))] = int(
-                    source.data(Qt.ItemDataRole.UserRole + 1)
-                )
             for job_id, groups in grouped.items():
                 validate_group_partition(
-                    [(group.start_page, group.end_page) for group in groups], page_counts[job_id]
+                    [(group.start_page, group.end_page) for group in groups], self._page_counts[job_id]
                 )
         except (TypeError, ValueError) as exc:
             QMessageBox.warning(self, "Invalid groups / 分組無效", str(exc))
@@ -315,7 +535,8 @@ class MainWindow(QMainWindow):
         self.current_batch_id: str | None = None
         self.output_ready: Path | None = None
         self.paths: list[Path] = []
-        self.setMinimumSize(1080, 760)
+        self.setMinimumSize(1180, 800)
+        self.setAcceptDrops(True)
         self._build_ui()
         self._apply_style()
         self.retranslate()
@@ -345,6 +566,16 @@ class MainWindow(QMainWindow):
         self.language_combo.currentIndexChanged.connect(self._change_language)
         title_row.addWidget(self.language_combo)
         outer.addLayout(title_row)
+
+        step_row = QHBoxLayout()
+        self.step_labels: list[QLabel] = []
+        for _ in range(4):
+            label = QLabel()
+            label.setObjectName("stepPill")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            step_row.addWidget(label, 1)
+            self.step_labels.append(label)
+        outer.addLayout(step_row)
 
         readiness = QHBoxLayout()
         self.lm_card, self.lm_title, self.lm_status = self._status_card()
@@ -395,13 +626,25 @@ class MainWindow(QMainWindow):
         self.down_button.clicked.connect(lambda: self.move_selected(1))
         outer.addLayout(file_header)
 
-        self.file_table = QTableWidget(0, 4)
+        self.file_table = QTableWidget(0, 5)
         self.file_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.file_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.file_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.file_table.setAlternatingRowColors(True)
+        self.file_table.verticalHeader().setVisible(False)
         self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.file_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         outer.addWidget(self.file_table, 2)
+        file_footer = QHBoxLayout()
+        self.file_summary_label = QLabel()
+        self.file_summary_label.setObjectName("summary")
+        self.drop_hint_label = QLabel()
+        self.drop_hint_label.setObjectName("muted")
+        file_footer.addWidget(self.file_summary_label)
+        file_footer.addStretch()
+        file_footer.addWidget(self.drop_hint_label)
+        outer.addLayout(file_footer)
 
         output_frame = QFrame()
         output_frame.setObjectName("panel")
@@ -418,6 +661,10 @@ class MainWindow(QMainWindow):
         self.review_checkbox = QCheckBox()
         self.review_checkbox.setChecked(True)
         output_layout.addWidget(self.review_checkbox)
+        self.output_hint_label = QLabel()
+        self.output_hint_label.setObjectName("muted")
+        self.output_hint_label.setWordWrap(True)
+        output_layout.addWidget(self.output_hint_label)
         outer.addWidget(output_frame)
 
         action_row = QHBoxLayout()
@@ -472,7 +719,13 @@ class MainWindow(QMainWindow):
             QLabel#title { font-size: 25pt; font-weight: 700; color: #0d3b35; }
             QLabel#subtitle { color: #56706b; font-size: 11pt; }
             QLabel#section { font-size: 11pt; font-weight: 700; color: #173f39; }
+            QLabel#stepPill { background: #dfe9e6; border: 1px solid #c3d3ce; border-radius: 10px; padding: 5px; color: #41635d; font-size: 9pt; font-weight: 700; }
+            QLabel#summary { color: #0b675b; font-weight: 700; }
+            QLabel#muted { color: #647b76; }
+            QLabel#dialogTitle { font-size: 18pt; font-weight: 700; color: #0d3b35; }
+            QLabel#seriesSummary { background: #e8f3ef; color: #174e45; border-radius: 6px; padding: 8px; font-weight: 700; }
             QFrame#panel, QFrame#statusCard { background: white; border: 1px solid #ccd9d5; border-radius: 8px; }
+            QFrame#softPanel { background: #f7faf9; border: 1px solid #d6e2de; border-radius: 7px; }
             QLabel#cardTitle { font-weight: 700; color: #355f58; }
             QPushButton { background: white; border: 1px solid #a9bbb6; border-radius: 5px; padding: 7px 11px; }
             QPushButton:hover { background: #e4efeb; }
@@ -480,6 +733,7 @@ class MainWindow(QMainWindow):
             QPushButton#primary { background: #0b675b; color: white; border: 0; font-weight: 700; padding: 9px 20px; }
             QPushButton#primary:hover { background: #095449; }
             QTableWidget, QTextEdit, QLineEdit, QComboBox { background: white; border: 1px solid #bdcdc8; border-radius: 4px; }
+            QTableWidget::item:selected { background: #cfe9e2; color: #133b34; }
             QHeaderView::section { background: #dfe9e6; padding: 6px; border: 0; border-right: 1px solid #c6d4d0; font-weight: 600; }
             QProgressBar { border: 1px solid #a8bbb5; border-radius: 5px; text-align: center; background: white; min-height: 23px; }
             QProgressBar::chunk { background: #19a38c; border-radius: 4px; }
@@ -497,6 +751,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{self.tr('title')} {__version__}")
         self.title_label.setText(self.tr("title"))
         self.subtitle_label.setText(self.tr("subtitle"))
+        for label, key in zip(
+            self.step_labels,
+            ("step_models", "step_files", "step_groups", "step_scan"),
+            strict=True,
+        ):
+            label.setText(self.tr(key))
         self.lm_title.setText(self.tr("lm"))
         self.yolo_title.setText(self.tr("yolo"))
         self.refresh_button.setText(self.tr("refresh"))
@@ -512,14 +772,16 @@ class MainWindow(QMainWindow):
         self.output_label.setText(self.tr("output"))
         self.output_browse_button.setText(self.tr("browse"))
         self.review_checkbox.setText(self.tr("review"))
-        self.start_button.setText(self.tr("start"))
         self.cancel_button.setText(self.tr("cancel"))
         self.resume_button.setText(self.tr("resume"))
         self.open_button.setText(self.tr("open"))
         self.log_label.setText(self.tr("log"))
+        self.drop_hint_label.setText(self.tr("drop_hint"))
+        self.output_hint_label.setText(self.tr("output_hint"))
         self.file_table.setHorizontalHeaderLabels(
-            [self.tr("source"), self.tr("type"), self.tr("path"), self.tr("status")]
+            [self.tr("source"), self.tr("type"), self.tr("path"), self.tr("workbook"), self.tr("status")]
         )
+        self._update_file_summary()
         if self.discovery:
             self._show_discovery(self.discovery)
 
@@ -583,7 +845,7 @@ class MainWindow(QMainWindow):
                 else f"● {self.tr('qwen_only')}"
             )
         )
-        self.start_button.setEnabled(ready and not self._busy())
+        self.start_button.setEnabled(ready and bool(self.paths) and not self._busy())
         if self.runtime:
             try:
                 removed = LocalBatchRunner(self.runtime).purge_expired()
@@ -605,11 +867,20 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, self.tr("select_folder"))
         if not folder:
             return
-        candidates = sorted(
-            (path for path in Path(folder).rglob("*") if path.is_file() and path.suffix.casefold() in ALLOWED_SUFFIXES),
-            key=lambda path: str(path).casefold(),
-        )
-        self._add_paths(candidates)
+        self._add_paths(self._expand_input_paths([Path(folder)]))
+
+    def _expand_input_paths(self, paths) -> list[Path]:
+        candidates: list[Path] = []
+        for path in paths:
+            if path.is_dir():
+                candidates.extend(
+                    child
+                    for child in path.rglob("*")
+                    if child.is_file() and child.suffix.casefold() in ALLOWED_SUFFIXES
+                )
+            elif path.is_file() and path.suffix.casefold() in ALLOWED_SUFFIXES:
+                candidates.append(path)
+        return sorted(candidates, key=lambda value: str(value).casefold())
 
     def _add_paths(self, paths) -> None:
         existing = {str(path).casefold() for path in self.paths}
@@ -629,9 +900,28 @@ class MainWindow(QMainWindow):
         for path in self.paths:
             row = self.file_table.rowCount()
             self.file_table.insertRow(row)
-            values = [path.name, path.suffix.upper().lstrip("."), str(path.parent), "Pending / 待處理"]
+            workbook_name = f"{path.stem}_FormSight.xlsx"
+            values = [
+                path.name,
+                path.suffix.upper().lstrip("."),
+                str(path.parent),
+                workbook_name,
+                "Pending / 待處理",
+            ]
             for column, value in enumerate(values):
-                self.file_table.setItem(row, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                item.setToolTip(str(path) if column in {0, 2} else value)
+                self.file_table.setItem(row, column, item)
+        self._update_file_summary()
+
+    def _update_file_summary(self) -> None:
+        count = len(self.paths)
+        self.file_summary_label.setText(
+            self.tr("file_summary").format(count=count) if count else self.tr("file_summary_empty")
+        )
+        self.start_button.setText(f"{self.tr('start')} · {count}" if count else self.tr("start"))
+        ready = bool(self.discovery and self.discovery.status == "ready")
+        self.start_button.setEnabled(bool(count and ready and not self._busy()))
 
     def remove_selected(self) -> None:
         rows = sorted({index.row() for index in self.file_table.selectedIndexes()}, reverse=True)
@@ -733,7 +1023,7 @@ class MainWindow(QMainWindow):
         self.progress.setFormat(f"{event.progress:.0%} — {event.message}")
         self._log(event.message)
         if event.source_index is not None and 0 <= event.source_index < self.file_table.rowCount():
-            self.file_table.item(event.source_index, 3).setText(event.message)
+            self.file_table.item(event.source_index, 4).setText(event.message)
 
     def _handle_success(self, result: Any) -> None:
         self._set_busy(False)
@@ -805,7 +1095,7 @@ class MainWindow(QMainWindow):
             text = str(item["status"])
             if item.get("error"):
                 text += f" — {item['error']}"
-            cell = self.file_table.item(row, 3)
+            cell = self.file_table.item(row, 4)
             cell.setText(text)
             if item["status"] == "failed":
                 cell.setForeground(QColor("#b42318"))
@@ -830,7 +1120,9 @@ class MainWindow(QMainWindow):
             self.resume_button,
         ):
             widget.setEnabled(not busy)
-        self.start_button.setEnabled(not busy and bool(self.discovery and self.discovery.status == "ready"))
+        self.start_button.setEnabled(
+            not busy and bool(self.paths) and bool(self.discovery and self.discovery.status == "ready")
+        )
         self.cancel_button.setEnabled(busy)
 
     def _busy(self) -> bool:
@@ -839,6 +1131,17 @@ class MainWindow(QMainWindow):
     def _log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log.append(f"[{stamp}] {message}")
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.mimeData().hasUrls() and any(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        local_paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
+        self._add_paths(self._expand_input_paths(local_paths))
+        event.acceptProposedAction()
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self._busy():

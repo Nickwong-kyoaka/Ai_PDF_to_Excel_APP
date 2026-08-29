@@ -54,7 +54,8 @@ if (-not $InstallerOnly) {
         Push-Location $ProjectRoot
         try {
             # The desktop environment intentionally excludes FastAPI; web tests run in backend\.venv.
-            $TestTemp = Join-Path $ProjectRoot "build\desktop-test-temp"
+            # A fresh base avoids Windows file-handle races from a previous pytest run.
+            $TestTemp = Join-Path $ProjectRoot ("build\desktop-test-temp-" + [guid]::NewGuid().ToString("N"))
             New-Item -ItemType Directory -Path $TestTemp -Force | Out-Null
             & $Python -m pytest desktop\tests -q --basetemp $TestTemp
             if ($LASTEXITCODE -ne 0) { throw "Desktop tests failed." }
@@ -115,3 +116,5 @@ if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed." }
 
 if (-not (Test-Path -LiteralPath $Setup)) { throw "Installer was not created." }
 Write-Host "Installer created: $Setup" -ForegroundColor Green
+& (Join-Path $PSScriptRoot "package-transfer.ps1") -SetupPath $Setup
+if ($LASTEXITCODE -ne 0) { throw "Transfer ZIP packaging failed." }

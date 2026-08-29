@@ -3,7 +3,7 @@
 #endif
 
 #define AppName "FormSight Local"
-#define AppVersion "0.2.0"
+#define AppVersion "0.3.0"
 #define AppPublisher "FormSight"
 #define AppExeName "FormSightLocal.exe"
 

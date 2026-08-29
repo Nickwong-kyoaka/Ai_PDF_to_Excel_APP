@@ -1,4 +1,4 @@
-from app.scanner.fusion import bbox_iou, fuse_page
+from app.scanner.fusion import bbox_iou, fuse_page, fuse_vision_models
 from app.scanner.yolo import Detection
 
 
@@ -45,3 +45,41 @@ def test_qwen_yolo_disagreement_requests_tiebreak():
 
 def test_bbox_iou():
     assert bbox_iou([0, 0, 1, 1], [0.5, 0.5, 1, 1]) == 0.25
+
+
+def test_dual_vision_agreement_is_confirmed_without_yolo():
+    result = fuse_vision_models(
+        [item("Yes")],
+        [item("Yes")],
+        "qwen/qwen3-vl-8b",
+        "google/gemma-3-4b",
+    )[0]
+    assert result.qwen_value == "Yes"
+    assert result.verifier_value == "Yes"
+    assert result.yolo_value is None
+    assert result.needs_review is False
+    assert "agree" in result.reason
+
+
+def test_dual_vision_disagreement_requires_cropped_adjudication():
+    result = fuse_vision_models(
+        [item("Yes")],
+        [item("No")],
+        "qwen/qwen3-vl-8b",
+        "google/gemma-3-4b",
+    )[0]
+    assert result.verifier_value == "No"
+    assert result.needs_tiebreak is True
+    assert result.needs_review is True
+
+
+def test_verifier_only_question_is_preserved_for_review():
+    result = fuse_vision_models(
+        [],
+        [item("Yes")],
+        "qwen/qwen3-vl-8b",
+        "google/gemma-3-4b",
+    )[0]
+    assert result.qwen_value is None
+    assert result.verifier_value == "Yes"
+    assert result.needs_review is True

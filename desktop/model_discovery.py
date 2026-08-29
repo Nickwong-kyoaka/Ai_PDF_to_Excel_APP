@@ -29,6 +29,7 @@ class DiscoveryResult:
     vision_models: list[DetectedModel] = field(default_factory=list)
     judge_models: list[DetectedModel] = field(default_factory=list)
     selected_vision: DetectedModel | None = None
+    selected_verifier: DetectedModel | None = None
     selected_judge: DetectedModel | None = None
     message: str = ""
 
@@ -66,20 +67,21 @@ def _is_vision(model: dict[str, Any]) -> bool:
     text = _text(model)
     capabilities = model.get("capabilities") or {}
     declared_vision = isinstance(capabilities, dict) and capabilities.get("vision") is True
-    return "qwen" in text and (
-        declared_vision
-        or any(
-            marker in text
-            for marker in (
-                "qwen3-vl",
-                "qwen3_vl",
-                "qwen3vl",
-                "qwen2.5-vl",
-                "qwen2_5_vl",
-                " vision",
-                "-vl",
-                "_vl",
-            )
+    return declared_vision or any(
+        marker in text
+        for marker in (
+            "qwen3-vl",
+            "qwen3_vl",
+            "qwen3vl",
+            "qwen2.5-vl",
+            "qwen2_5_vl",
+            "gemma-3-4b",
+            "gemma3",
+            "internvl",
+            "minicpm-v",
+            " vision",
+            "-vl",
+            "_vl",
         )
     )
 
@@ -92,7 +94,28 @@ def _vision_score(model: dict[str, Any]) -> int:
         return 300
     if "qwen2.5-vl" in text or "qwen2_5_vl" in text:
         return 200
-    return 100 if _is_vision(model) else 0
+    if "qwen" in text and _is_vision(model):
+        return 100
+    return 10 if _is_vision(model) else 0
+
+
+def select_verifier_model(
+    models: list[DetectedModel], primary: DetectedModel
+) -> DetectedModel | None:
+    def verifier_score(model: DetectedModel) -> tuple[int, str]:
+        text = f"{model.key} {model.display_name} {model.architecture}".casefold()
+        if model.api_id == primary.api_id or "qwen" in text:
+            return (-1, model.display_name.casefold())
+        if "gemma-3-4b" in text or ("gemma3" in text and "4b" in text):
+            return (500, model.display_name.casefold())
+        if "internvl" in text and "4b" in text:
+            return (450, model.display_name.casefold())
+        if any(size in text for size in ("2b", "3b", "4b", "5b")):
+            return (400, model.display_name.casefold())
+        return (300, model.display_name.casefold())
+
+    candidates = [model for model in models if verifier_score(model)[0] >= 0]
+    return max(candidates, key=verifier_score, default=None)
 
 
 def _judge_score(model: dict[str, Any]) -> int:
@@ -210,13 +233,33 @@ def discover_models(timeout: float = 5.0) -> DiscoveryResult:
                 "'Serve on Local Network' disabled. / 無法確認 LM Studio 僅限本機；請停用網路分享後重新啟動。"
             ),
         )
-    if not vision:
+    qwen_vision = [
+        model
+        for model in vision
+        if "qwen" in f"{model.key} {model.display_name} {model.architecture}".casefold()
+    ]
+    if not qwen_vision:
         return DiscoveryResult(
             "no_vision_model", base_url, port, judge_models=judges,
+            vision_models=vision,
             message="LM Studio is online, but no loaded Qwen vision model was detected.",
         )
-    selected_vision = vision[0]
-    selected_judge = judges[0] if judges else selected_vision
+    selected_vision = qwen_vision[0]
+    selected_verifier = select_verifier_model(vision, selected_vision)
+    if not selected_verifier:
+        return DiscoveryResult(
+            "verifier_required",
+            base_url,
+            port,
+            vision_models=vision,
+            judge_models=judges,
+            selected_vision=selected_vision,
+            selected_judge=selected_vision,
+            message=(
+                "Load a second, non-Qwen vision model in LM Studio. Recommended: "
+                "google/gemma-3-4b Q4 with 16384 context and Flash Attention."
+            ),
+        )
     return DiscoveryResult(
         "ready",
         base_url,
@@ -224,6 +267,7 @@ def discover_models(timeout: float = 5.0) -> DiscoveryResult:
         vision_models=vision,
         judge_models=judges,
         selected_vision=selected_vision,
-        selected_judge=selected_judge,
-        message="Loaded models detected automatically.",
+        selected_verifier=selected_verifier,
+        selected_judge=selected_vision,
+        message="Sequential dual-model consensus is ready.",
     )

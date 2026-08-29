@@ -14,12 +14,14 @@ def loaded_model(
     architecture: str,
     display: str | None = None,
     loaded: bool = True,
+    vision: bool | None = None,
 ) -> dict:
     return {
         "type": "llm",
         "key": key,
         "display_name": display or key,
         "architecture": architecture,
+        "capabilities": {"vision": vision} if vision is not None else {},
         "quantization": {"name": "Q4_K_M"},
         "max_context_length": 32768,
         "loaded_instances": (
@@ -28,13 +30,14 @@ def loaded_model(
     }
 
 
-def test_loaded_model_priority_and_judge_fallback() -> None:
+def test_loaded_model_priority_and_non_qwen_verifier() -> None:
     payload = {
         "models": [
             loaded_model("qwen/qwen2.5-vl-7b", architecture="qwen2_5_vl"),
             loaded_model("qwen/qwen3-vl-4b", architecture="qwen3_vl"),
             loaded_model("qwen/qwen3-vl-8b", architecture="qwen3_vl"),
             loaded_model("qwen/qwen3-8b", architecture="qwen3"),
+            loaded_model("google/gemma-3-4b", architecture="gemma3", vision=True),
             loaded_model("qwen/qwen3-vl-32b", architecture="qwen3_vl", loaded=False),
         ]
     }
@@ -42,6 +45,7 @@ def test_loaded_model_priority_and_judge_fallback() -> None:
     assert vision[0].key == "qwen/qwen3-vl-8b"
     assert judges[0].key == "qwen/qwen3-8b"
     assert all(model.key != "qwen/qwen3-vl-32b" for model in vision)
+    assert model_discovery.select_verifier_model(vision, vision[0]).key == "google/gemma-3-4b"
 
 
 def test_lms_status_port_discovery(monkeypatch) -> None:
@@ -73,7 +77,7 @@ def test_discovery_reports_authentication_and_offline(monkeypatch) -> None:
     assert model_discovery.discover_models().status == "offline"
 
 
-def test_discovery_reuses_vision_when_no_text_judge(monkeypatch) -> None:
+def test_discovery_requires_independent_non_qwen_verifier(monkeypatch) -> None:
     monkeypatch.setattr(model_discovery, "discover_lmstudio_port", lambda: 5555)
     monkeypatch.setattr(model_discovery, "loopback_binding_only", lambda _port: True)
     payload = {"models": [loaded_model("qwen/qwen3-vl-8b", architecture="qwen3_vl")]}
@@ -87,8 +91,33 @@ def test_discovery_reuses_vision_when_no_text_judge(monkeypatch) -> None:
         ),
     )
     result = model_discovery.discover_models()
-    assert result.status == "ready"
+    assert result.status == "verifier_required"
     assert result.base_url == "http://127.0.0.1:5555"
+    assert result.selected_judge == result.selected_vision
+
+
+def test_discovery_selects_gemma_verifier_and_reuses_primary_for_judging(monkeypatch) -> None:
+    monkeypatch.setattr(model_discovery, "discover_lmstudio_port", lambda: 5555)
+    monkeypatch.setattr(model_discovery, "loopback_binding_only", lambda _port: True)
+    payload = {
+        "models": [
+            loaded_model("qwen/qwen3-vl-8b", architecture="qwen3_vl"),
+            loaded_model("google/gemma-3-4b", architecture="gemma3", vision=True),
+        ]
+    }
+    monkeypatch.setattr(
+        model_discovery.httpx,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200,
+            raise_for_status=lambda: None,
+            json=lambda: payload,
+        ),
+    )
+    result = model_discovery.discover_models()
+    assert result.status == "ready"
+    assert result.selected_vision.key == "qwen/qwen3-vl-8b"
+    assert result.selected_verifier.key == "google/gemma-3-4b"
     assert result.selected_judge == result.selected_vision
 
 

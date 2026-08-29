@@ -4,6 +4,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
 from .yolo import Detection
@@ -119,6 +120,8 @@ class FusedAnswer:
     evidence: list[dict[str, Any]]
     needs_review: bool
     needs_tiebreak: bool
+    verifier_value: Any = None
+    verifier_model_id: str | None = None
 
 
 def reconcile_qwen(first: dict[str, Any], second: dict[str, Any] | None) -> tuple[Any, float, str, bool]:
@@ -169,4 +172,136 @@ def fuse_page(
         else:
             reason = qwen_reason if not selection else f"{qwen_reason}; custom YOLO unavailable"
             output.append(FusedAnswer(item, qwen_value, yolo_value, qwen_value, qwen_conf, reason, evidence, qwen_conflict or qwen_conf < 0.80, qwen_conflict))
+    return output
+
+
+def _match_score(primary: dict[str, Any], verifier: dict[str, Any]) -> float:
+    primary_id = item_key(primary)
+    verifier_id = item_key(verifier)
+    if primary_id and verifier_id and primary_id.casefold() == verifier_id.casefold():
+        return 2.0
+    primary_text = clean_text(primary.get("question_text")).casefold()
+    verifier_text = clean_text(verifier.get("question_text")).casefold()
+    text_score = SequenceMatcher(None, primary_text, verifier_text).ratio() if primary_text and verifier_text else 0.0
+    primary_box = valid_bbox(primary.get("question_bbox")) or valid_bbox(primary.get("answer_bbox"))
+    verifier_box = valid_bbox(verifier.get("question_bbox")) or valid_bbox(verifier.get("answer_bbox"))
+    geometry_score = bbox_iou(primary_box, verifier_box) if primary_box and verifier_box else 0.0
+    return text_score * 0.78 + geometry_score * 0.22
+
+
+def _model_evidence(item: dict[str, Any], source: str, model_id: str) -> list[dict[str, Any]]:
+    bbox = valid_bbox(item.get("answer_bbox")) or valid_bbox(item.get("question_bbox"))
+    if not bbox:
+        return []
+    return [
+        {
+            "source": source,
+            "model_id": model_id,
+            "label": "answer region",
+            "bbox": bbox,
+            "confidence": float(item.get("confidence") or 0),
+        }
+    ]
+
+
+def fuse_vision_models(
+    primary_items: list[dict[str, Any]],
+    verifier_items: list[dict[str, Any]],
+    primary_model_id: str,
+    verifier_model_id: str,
+) -> list[FusedAnswer]:
+    """Associate and fuse two independent vision-model extractions without YOLO."""
+
+    unmatched = set(range(len(verifier_items)))
+    output: list[FusedAnswer] = []
+    for primary in primary_items:
+        candidates = sorted(
+            ((_match_score(primary, verifier_items[index]), index) for index in unmatched),
+            reverse=True,
+        )
+        matched: dict[str, Any] | None = None
+        if candidates and candidates[0][0] >= 0.66:
+            _, matched_index = candidates[0]
+            unmatched.remove(matched_index)
+            matched = verifier_items[matched_index]
+
+        primary_value = item_value(primary)
+        primary_confidence = float(primary.get("confidence") or 0)
+        evidence = _model_evidence(primary, "primary_vision", primary_model_id)
+        if matched is None:
+            output.append(
+                FusedAnswer(
+                    item=primary,
+                    qwen_value=primary_value,
+                    yolo_value=None,
+                    scanner_value=primary_value,
+                    confidence=primary_confidence * 0.78,
+                    reason="Primary vision model found an answer that the verifier did not match",
+                    evidence=evidence,
+                    needs_review=True,
+                    needs_tiebreak=True,
+                    verifier_value=None,
+                    verifier_model_id=verifier_model_id,
+                )
+            )
+            continue
+
+        verifier_value = item_value(matched)
+        verifier_confidence = float(matched.get("confidence") or 0)
+        evidence.extend(_model_evidence(matched, "verifier_vision", verifier_model_id))
+        if normalized(primary_value) == normalized(verifier_value):
+            confidence = min(0.99, max(primary_confidence, verifier_confidence) + 0.05)
+            low_confidence = confidence < 0.80
+            output.append(
+                FusedAnswer(
+                    item=primary,
+                    qwen_value=primary_value,
+                    yolo_value=None,
+                    scanner_value=primary_value,
+                    confidence=confidence,
+                    reason="Primary and independent verifier vision models agree",
+                    evidence=evidence,
+                    needs_review=low_confidence,
+                    needs_tiebreak=False,
+                    verifier_value=verifier_value,
+                    verifier_model_id=verifier_model_id,
+                )
+            )
+        else:
+            chosen = primary_value if primary_confidence >= verifier_confidence else verifier_value
+            output.append(
+                FusedAnswer(
+                    item=primary,
+                    qwen_value=primary_value,
+                    yolo_value=None,
+                    scanner_value=chosen,
+                    confidence=max(primary_confidence, verifier_confidence) * 0.66,
+                    reason="Primary and independent verifier vision models disagree; cropped adjudication required",
+                    evidence=evidence,
+                    needs_review=True,
+                    needs_tiebreak=True,
+                    verifier_value=verifier_value,
+                    verifier_model_id=verifier_model_id,
+                )
+            )
+
+    for index in sorted(unmatched):
+        verifier = verifier_items[index]
+        verifier_value = item_value(verifier)
+        verifier_confidence = float(verifier.get("confidence") or 0)
+        output.append(
+            FusedAnswer(
+                item=verifier,
+                qwen_value=None,
+                yolo_value=None,
+                scanner_value=verifier_value,
+                confidence=verifier_confidence * 0.72,
+                reason="Independent verifier found an answer that the primary model missed",
+                evidence=_model_evidence(verifier, "verifier_vision", verifier_model_id),
+                needs_review=True,
+                needs_tiebreak=True,
+                verifier_value=verifier_value,
+                verifier_model_id=verifier_model_id,
+            )
+        )
     return output

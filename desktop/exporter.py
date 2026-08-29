@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.models import Answer, Job, LocalBatch, LocalBatchItem, QuestionnaireGroup, ReviewEvent
+from backend.app.scanner.fusion import normalized
 
 
 SHEETS = (
@@ -55,8 +56,12 @@ def _flag_for(answer: Answer) -> str:
         flags.append("QWEN_CORRECTION_PENDING_REVIEW")
     if answer.reasonableness_status not in {None, "reasonable", "not_checked"}:
         flags.append(str(answer.reasonableness_status).upper())
-    if answer.yolo_value is not None and answer.qwen_value is not None and answer.yolo_value != answer.qwen_value:
-        flags.append("QWEN_YOLO_CONFLICT")
+    if (
+        answer.verifier_value is not None
+        and answer.qwen_value is not None
+        and normalized(answer.verifier_value) != normalized(answer.qwen_value)
+    ):
+        flags.append("PRIMARY_VERIFIER_CONFLICT")
     return "; ".join(dict.fromkeys(flags)) or "OK"
 
 
@@ -101,8 +106,12 @@ def _answer_row(
     language: str,
 ) -> dict[str, Any]:
     evidence = answer.evidence or []
-    qwen_evidence = [entry for entry in evidence if entry.get("source") == "qwen"]
-    yolo_evidence = [entry for entry in evidence if entry.get("source") == "yolo"]
+    primary_evidence = [
+        entry
+        for entry in evidence
+        if entry.get("source") in {"qwen", "primary_vision", "primary_adjudicator"}
+    ]
+    verifier_evidence = [entry for entry in evidence if entry.get("source") == "verifier_vision"]
     return {
         "Source_File": Path(item.original_path).name,
         "Source_File_Index": item.order_index + 1,
@@ -116,10 +125,13 @@ def _answer_row(
         "Answer_Type": answer.answer_type,
         "Allowed_Options": answer.allowed_options,
         "Selected_Options": answer.selected_options,
-        "Qwen_Value": answer.qwen_value,
-        "YOLO_Value": answer.yolo_value,
-        "Qwen_Evidence": qwen_evidence,
-        "YOLO_Evidence": yolo_evidence,
+        "Primary_Model_ID": (job.profile_snapshot or {}).get("extractor_model_id"),
+        "Verifier_Model_ID": answer.verifier_model_id
+        or (job.profile_snapshot or {}).get("verifier_model_id"),
+        "Primary_Model_Value": answer.qwen_value,
+        "Verifier_Model_Value": answer.verifier_value,
+        "Primary_Model_Evidence": primary_evidence,
+        "Verifier_Model_Evidence": verifier_evidence,
         "Scanner_Value_Immutable": answer.scanner_value,
         "Scanner_Confidence": answer.scanner_confidence,
         "Fusion_Reason": answer.fusion_reason,
@@ -213,8 +225,8 @@ def write_source_excel(
                             "Source_Page",
                             "Question_ID",
                             "Question_Text",
-                            "Qwen_Evidence",
-                            "YOLO_Evidence",
+                            "Primary_Model_Evidence",
+                            "Verifier_Model_Evidence",
                             "Scanner_Value_Immutable",
                             "Final_Value",
                             "Flag_Status",
@@ -316,6 +328,7 @@ def write_source_excel(
             "Started_At": item.started_at,
             "Finished_At": item.finished_at,
             "Vision_Model": batch.extractor_model_id,
+            "Verifier_Model": batch.verifier_model_id,
             "Judge_Model": batch.judge_model_id,
             "LM_Studio": batch.lmstudio_base_url,
         }
@@ -355,10 +368,12 @@ def write_source_excel(
         "Answer_Type",
         "Allowed_Options",
         "Selected_Options",
-        "Qwen_Value",
-        "YOLO_Value",
-        "Qwen_Evidence",
-        "YOLO_Evidence",
+        "Primary_Model_ID",
+        "Verifier_Model_ID",
+        "Primary_Model_Value",
+        "Verifier_Model_Value",
+        "Primary_Model_Evidence",
+        "Verifier_Model_Evidence",
         "Scanner_Value_Immutable",
         "Scanner_Confidence",
         "Fusion_Reason",
@@ -383,8 +398,8 @@ def write_source_excel(
         "Source_Page",
         "Question_ID",
         "Question_Text",
-        "Qwen_Evidence",
-        "YOLO_Evidence",
+        "Primary_Model_Evidence",
+        "Verifier_Model_Evidence",
         "Scanner_Value_Immutable",
         "Final_Value",
         "Flag_Status",
@@ -423,6 +438,7 @@ def write_source_excel(
             "Started_At",
             "Finished_At",
             "Vision_Model",
+            "Verifier_Model",
             "Judge_Model",
             "LM_Studio",
         ],

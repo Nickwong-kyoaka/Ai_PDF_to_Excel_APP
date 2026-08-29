@@ -92,6 +92,7 @@ class LocalBatchRunner:
         *,
         review_groups: bool,
         extractor_model_id: str | None = None,
+        verifier_model_id: str | None = None,
         judge_model_id: str | None = None,
     ) -> str:
         source_paths: list[Path] = []
@@ -109,11 +110,14 @@ class LocalBatchRunner:
                 raise ValueError(f"Unsupported file type: {source.name}")
             if not source.is_file():
                 raise ValueError(f"File not found: {source}")
-        if discovery.status != "ready" or not discovery.selected_vision:
+        if discovery.status != "ready" or not discovery.selected_vision or not discovery.selected_verifier:
             raise ValueError(discovery.message or "LM Studio is not ready")
 
         vision_id = extractor_model_id or discovery.selected_vision.api_id
-        judge_id = judge_model_id or (discovery.selected_judge or discovery.selected_vision).api_id
+        verifier_id = verifier_model_id or discovery.selected_verifier.api_id
+        if verifier_id == vision_id:
+            raise ValueError("Primary and verifier vision models must be different")
+        judge_id = judge_model_id or vision_id
         output = Path(output_path).expanduser().resolve()
         if output.exists() and not output.is_dir():
             raise ValueError("The output location must be a folder")
@@ -145,6 +149,7 @@ class LocalBatchRunner:
                 review_groups=review_groups,
                 lmstudio_base_url=discovery.base_url,
                 extractor_model_id=vision_id,
+                verifier_model_id=verifier_id,
                 judge_model_id=judge_id,
                 stage_message="Preparing files / 正在準備檔案",
             )
@@ -221,6 +226,7 @@ class LocalBatchRunner:
                         "slug": profile.slug,
                         "name": profile.name,
                         "extractor_model_id": batch.extractor_model_id,
+                        "verifier_model_id": batch.verifier_model_id,
                         "judge_model_id": batch.judge_model_id,
                         "quantization": profile.quantization,
                         "context_length": profile.context_length,
@@ -378,6 +384,7 @@ class LocalBatchRunner:
             )
             profile = {
                 "extractor_model_id": batch.extractor_model_id,
+                "verifier_model_id": batch.verifier_model_id,
                 "judge_model_id": batch.judge_model_id,
                 "image_max_side": 3000,
                 "verification_mode": "maximum",
@@ -566,6 +573,7 @@ class LocalBatchRunner:
                 "error": batch.error,
                 "output_directory": batch.output_path,
                 "extractor_model_id": batch.extractor_model_id,
+                "verifier_model_id": batch.verifier_model_id,
                 "judge_model_id": batch.judge_model_id,
                 "items": [
                     {

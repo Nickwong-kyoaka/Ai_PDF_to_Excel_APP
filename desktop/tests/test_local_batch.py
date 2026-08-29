@@ -23,12 +23,23 @@ def ready_discovery() -> DiscoveryResult:
         vision=True,
         score=400,
     )
+    verifier = DetectedModel(
+        api_id="gemma-verifier-loaded",
+        key="google/gemma-3-4b",
+        display_name="Gemma 3 4B",
+        architecture="gemma3",
+        quantization="Q4",
+        context_length=8192,
+        vision=True,
+        score=10,
+    )
     return DiscoveryResult(
         status="ready",
         base_url="http://127.0.0.1:1234",
         port=1234,
-        vision_models=[vision],
+        vision_models=[vision, verifier],
         selected_vision=vision,
+        selected_verifier=verifier,
         selected_judge=vision,
     )
 
@@ -40,6 +51,9 @@ class FakeYolo:
 
 class FakeExtractor:
     def __init__(self, settings, profile, weights=None, **kwargs):
+        assert profile["extractor_model_id"] == "qwen-vision-loaded"
+        assert profile["verifier_model_id"] == "gemma-verifier-loaded"
+        assert profile["judge_model_id"] == "qwen-vision-loaded"
         self.yolo = FakeYolo()
 
     def extract_job(self, db, job) -> None:
@@ -58,9 +72,11 @@ class FakeExtractor:
                 selected_options=["Yes"],
                 qwen_value="Yes",
                 yolo_value=None,
+                verifier_value="Yes",
+                verifier_model_id="gemma-verifier-loaded",
                 scanner_value="Yes",
                 scanner_confidence=0.88,
-                fusion_reason="Qwen-only mode",
+                fusion_reason="Primary and independent verifier vision models agree",
                 final_value="Yes",
                 final_source="scanner",
                 review_status="pending",
@@ -125,7 +141,10 @@ def test_mixed_batch_writes_one_corresponding_workbook_per_input(tmp_path, monke
     headers = [cell.value for cell in workbook["Long_Answers"][1]]
     scanner_col = headers.index("Scanner_Value_Immutable") + 1
     source_col = headers.index("Source_File") + 1
+    verifier_col = headers.index("Verifier_Model_Value") + 1
     assert workbook["Long_Answers"].cell(2, scanner_col).value == "Yes"
+    assert workbook["Long_Answers"].cell(2, verifier_col).value == "Yes"
+    assert "YOLO_Value" not in headers
     sources = {
         row[source_col - 1]
         for row in workbook["Long_Answers"].iter_rows(min_row=2, values_only=True)

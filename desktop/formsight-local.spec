@@ -2,34 +2,15 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files
 
 
 ROOT = Path(SPECPATH).resolve().parents[0]
 datas = [
     (str(ROOT / "universal_questionnaire_lmstudio_extractor_v14_consensus_geometry.py"), "."),
 ]
-weights = ROOT / "backend" / "models" / "questionnaire_marks.onnx"
-if weights.exists():
-    datas.append((str(weights), "models"))
-
-binaries = collect_dynamic_libs("onnxruntime")
-for package in (
-    "nvidia.cublas",
-    "nvidia.cuda_nvrtc",
-    "nvidia.cuda_runtime",
-    "nvidia.cudnn",
-    "nvidia.cufft",
-    "nvidia.curand",
-    "nvidia.nvjitlink",
-):
-    try:
-        binaries += collect_dynamic_libs(package)
-    except Exception:
-        # CPU fallback remains available when an intentionally CPU-only build environment is used.
-        pass
+binaries = []
 hiddenimports = [
-    "onnxruntime.capi._pybind_state",
     "pydantic_settings",
     "sqlalchemy.dialects.sqlite",
     "PIL.ImageQt",
@@ -46,7 +27,16 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["fastapi", "uvicorn", "starlette", "ultralytics", "torch", "torchvision"],
+    excludes=[
+        "fastapi",
+        "uvicorn",
+        "starlette",
+        "ultralytics",
+        "onnxruntime",
+        "nvidia",
+        "torch",
+        "torchvision",
+    ],
     noarchive=False,
     optimize=1,
 )

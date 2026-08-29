@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings
 from ..models import Answer, Job, QuestionnaireGroup, Rule
-from .fusion import FusedAnswer, clean_text, fuse_page, item_key, valid_bbox
+from .fusion import FusedAnswer, clean_text, fuse_page, fuse_vision_models, item_key, valid_bbox
 from .legacy import V14Compatibility
 from .lmstudio import LMStudioGateway
 from .prompts import conflict_prompt, extraction_prompt, judge_prompt, orientation_prompt
@@ -117,12 +117,13 @@ class QuestionnaireExtractor:
         total_pages: int,
         pass_name: str,
         include_tiles: bool,
+        model_id: str | None = None,
     ) -> list[dict[str, Any]]:
         evidence_images = [image]
         if include_tiles:
             evidence_images.extend(self.legacy.zoom_tiles(image, max_tiles=4))
         response = self.gateway.chat_json(
-            model=self.profile["extractor_model_id"],
+            model=model_id or self.profile["extractor_model_id"],
             prompt=extraction_prompt(page_number, total_pages, pass_name),
             images=evidence_images,
             max_tokens=8192,
@@ -139,10 +140,11 @@ class QuestionnaireExtractor:
 
     def tiebreak(self, image: Image.Image, fused: FusedAnswer) -> FusedAnswer:
         bbox = valid_bbox(fused.item.get("answer_bbox")) or valid_bbox(fused.item.get("question_bbox"))
+        independent_value = fused.verifier_value if fused.verifier_model_id else fused.yolo_value
         try:
             result = self.gateway.chat_json(
                 model=self.profile["extractor_model_id"],
-                prompt=conflict_prompt(fused.item, [fused.qwen_value, fused.yolo_value]),
+                prompt=conflict_prompt(fused.item, [fused.qwen_value, independent_value]),
                 images=[crop_bbox(image, bbox)],
                 max_tokens=700,
                 retries=1,
@@ -151,12 +153,13 @@ class QuestionnaireExtractor:
                 resolved = result.get("value")
                 fused.scanner_value = resolved
                 fused.confidence = float(result.get("confidence"))
-                fused.reason += f"; cropped Qwen tiebreak: {clean_text(result.get('reason'))}"
-                fused.needs_review = normalized_mismatch(resolved, fused.qwen_value, fused.yolo_value)
+                fused.reason += f"; cropped primary-model adjudication: {clean_text(result.get('reason'))}"
+                fused.needs_review = normalized_mismatch(resolved, fused.qwen_value, independent_value)
                 fused.evidence.append(
                     {
-                        "source": "qwen_tiebreak",
-                        "label": "cropped verification",
+                        "source": "primary_adjudicator",
+                        "model_id": self.profile["extractor_model_id"],
+                        "label": "cropped conflict adjudication",
                         "bbox": bbox or [0, 0, 1, 1],
                         "confidence": fused.confidence,
                     }
@@ -175,16 +178,58 @@ class QuestionnaireExtractor:
     ) -> tuple[list[FusedAnswer], dict[str, Any]]:
         image = render_page(source, page_number, int(self.profile.get("image_max_side", 3000)))
         image = self.orient(self.legacy.enhance(image))
-        first = self.extract_pass(image, page_number, total_pages, "first pass", False)
-        second = self.extract_pass(image, page_number, total_pages, "independent verification pass", True)
-        detections = self.yolo.detect(image)
-        fused_answers = fuse_page(first, second, detections, yolo_available)
+        primary_model_id = self.profile["extractor_model_id"]
+        verifier_model_id = self.profile.get("verifier_model_id")
+        model_errors: dict[str, str] = {}
+        if verifier_model_id:
+            try:
+                first = self.extract_pass(
+                    image,
+                    page_number,
+                    total_pages,
+                    "primary vision model pass",
+                    False,
+                    primary_model_id,
+                )
+            except Exception as exc:
+                first = []
+                model_errors["primary"] = str(exc)
+            try:
+                second = self.extract_pass(
+                    image,
+                    page_number,
+                    total_pages,
+                    "independent verifier vision model pass",
+                    True,
+                    verifier_model_id,
+                )
+            except Exception as exc:
+                second = []
+                model_errors["verifier"] = str(exc)
+            if not first and not second:
+                raise RuntimeError(f"Both vision model passes failed: {model_errors}")
+            detections = []
+            fused_answers = fuse_vision_models(
+                first, second, primary_model_id, str(verifier_model_id)
+            )
+        else:
+            first = self.extract_pass(
+                image, page_number, total_pages, "primary vision model pass", False, primary_model_id
+            )
+            second = self.extract_pass(
+                image, page_number, total_pages, "independent verification pass", True
+            )
+            detections = self.yolo.detect(image)
+            fused_answers = fuse_page(first, second, detections, yolo_available)
         for fused in fused_answers:
             if fused.needs_tiebreak:
                 self.tiebreak(image, fused)
         return fused_answers, {
-            "first": first,
-            "second": second,
+            "primary_model_id": primary_model_id,
+            "primary": first,
+            "verifier_model_id": verifier_model_id,
+            "verifier": second,
+            "model_errors": model_errors,
             "yolo": [detection.as_dict() for detection in detections],
         }
 
@@ -201,7 +246,8 @@ class QuestionnaireExtractor:
         ).all()
         total_work_pages = sum(group.end_page - group.start_page + 1 for group in groups)
         processed = 0
-        yolo_available = self.yolo.health()["status"] == "online"
+        dual_vision = bool(self.profile.get("verifier_model_id"))
+        yolo_available = False if dual_vision else self.yolo.health()["status"] == "online"
         debug_dir = self.settings.artifacts_dir / job.id / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
         page_failures: list[dict[str, Any]] = []
@@ -225,6 +271,18 @@ class QuestionnaireExtractor:
                     )
                     for fused in fused_answers:
                         selected = fused.item.get("selected_options") or []
+                        if fused.verifier_model_id and fused.item.get("answer_type") in {
+                            "single_choice",
+                            "multi_choice",
+                            "yes_no",
+                            "consent",
+                            "scale",
+                            "matrix",
+                        }:
+                            if isinstance(fused.scanner_value, list):
+                                selected = fused.scanner_value
+                            elif fused.scanner_value is not None and fused.scanner_value != "":
+                                selected = [fused.scanner_value]
                         db.add(
                             Answer(
                                 job_id=job.id,
@@ -238,6 +296,8 @@ class QuestionnaireExtractor:
                                 selected_options=selected,
                                 qwen_value=fused.qwen_value,
                                 yolo_value=fused.yolo_value,
+                                verifier_value=fused.verifier_value,
+                                verifier_model_id=fused.verifier_model_id,
                                 scanner_value=fused.scanner_value,
                                 scanner_confidence=fused.confidence,
                                 fusion_reason=fused.reason,

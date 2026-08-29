@@ -36,8 +36,6 @@ from PySide6.QtWidgets import (
 )
 
 from backend.app.documents import ProposedGroup, validate_group_partition
-from backend.app.scanner.yolo import YoloMarkDetector
-
 from . import __version__
 from .model_discovery import DiscoveryResult, discover_models
 from .runner import ALLOWED_SUFFIXES, GroupDraft, LocalBatchRunner, RunnerEvent
@@ -50,7 +48,7 @@ TEXT = {
         "subtitle": "Batch input → one corresponding Excel workbook per file",
         "language": "介面語言",
         "lm": "LM Studio",
-        "yolo": "YOLO marks",
+        "yolo": "Sequential consensus",
         "refresh": "Refresh detection",
         "add_files": "Add Files",
         "add_folder": "Add Folder",
@@ -62,16 +60,16 @@ TEXT = {
         "output": "Output folder",
         "browse": "Browse…",
         "review": "Review page groups before scanning",
-        "vision": "Vision extractor",
-        "judge": "Reasonableness checker",
+        "vision": "Primary vision model + judge",
+        "judge": "Independent non-Qwen verifier",
         "start": "Start Scan",
         "cancel": "Cancel",
         "resume": "Resume Last Batch",
         "open": "Open Output Folder",
         "ready": "Ready",
         "not_ready": "Not ready",
-        "qwen_only": "Qwen-only mode — no accepted YOLO ONNX weights found",
-        "yolo_ready": "ONNX detector ready",
+        "qwen_only": "Load both the primary and verifier models in LM Studio",
+        "yolo_ready": "Dual-model pipeline ready",
         "source": "Source file",
         "type": "Type",
         "path": "Location",
@@ -89,7 +87,7 @@ TEXT = {
         "subtitle": "批量輸入 → 每個檔案各自輸出一個 Excel 活頁簿",
         "language": "Interface language",
         "lm": "LM Studio",
-        "yolo": "YOLO 標記辨識",
+        "yolo": "順序式雙模型共識",
         "refresh": "重新偵測",
         "add_files": "加入檔案",
         "add_folder": "加入資料夾",
@@ -101,16 +99,16 @@ TEXT = {
         "output": "輸出資料夾",
         "browse": "瀏覽…",
         "review": "掃描前檢查頁面分組",
-        "vision": "視覺擷取模型",
-        "judge": "合理性檢查模型",
+        "vision": "主要視覺模型兼合理性判斷",
+        "judge": "獨立非 Qwen 驗證模型",
         "start": "開始掃描",
         "cancel": "取消",
         "resume": "恢復上次批次",
         "open": "開啟輸出資料夾",
         "ready": "準備完成",
         "not_ready": "尚未準備",
-        "qwen_only": "僅使用 Qwen 模式 — 找不到已核准的 YOLO ONNX 權重",
-        "yolo_ready": "ONNX 偵測器準備完成",
+        "qwen_only": "請在 LM Studio 同時載入主要及驗證模型",
+        "yolo_ready": "雙模型流程準備完成",
         "source": "來源檔案",
         "type": "類型",
         "path": "位置",
@@ -542,41 +540,48 @@ class MainWindow(QMainWindow):
         ready = result.status == "ready"
         color = "#117d65" if ready else "#b14a3c"
         self.lm_status.setStyleSheet(f"color: {color}; font-weight: 600;")
-        if ready and result.selected_vision:
+        if ready and result.selected_vision and result.selected_verifier:
             self.lm_status.setText(
-                f"● {self.tr('ready')} — {result.selected_vision.display_name}\n127.0.0.1:{result.port}"
+                f"● {self.tr('ready')} — {result.selected_vision.display_name}\n"
+                f"+ {result.selected_verifier.display_name} · 127.0.0.1:{result.port}"
             )
         else:
             self.lm_status.setText(f"● {self.tr('not_ready')} — {result.message}")
         self.vision_combo.clear()
         self.judge_combo.clear()
-        for model in result.vision_models:
+        primary_options = [
+            model
+            for model in result.vision_models
+            if "qwen" in f"{model.key} {model.display_name} {model.architecture}".casefold()
+        ]
+        verifier_options = [
+            model
+            for model in result.vision_models
+            if "qwen" not in f"{model.key} {model.display_name} {model.architecture}".casefold()
+        ]
+        for model in primary_options:
             self.vision_combo.addItem(f"{model.display_name} [{model.api_id}]", model.api_id)
-        judge_options = list(result.judge_models)
-        if result.selected_vision and all(item.api_id != result.selected_vision.api_id for item in judge_options):
-            judge_options.append(result.selected_vision)
-        for model in judge_options:
-            suffix = " — reuse vision / 重用視覺模型" if model.vision else ""
-            self.judge_combo.addItem(f"{model.display_name}{suffix}", model.api_id)
-        if result.selected_judge:
-            index = self.judge_combo.findData(result.selected_judge.api_id)
+        for model in verifier_options:
+            self.judge_combo.addItem(f"{model.display_name} [{model.api_id}]", model.api_id)
+        if result.selected_vision:
+            index = self.vision_combo.findData(result.selected_vision.api_id)
+            if index >= 0:
+                self.vision_combo.setCurrentIndex(index)
+        if result.selected_verifier:
+            index = self.judge_combo.findData(result.selected_verifier.api_id)
             if index >= 0:
                 self.judge_combo.setCurrentIndex(index)
-        weights_ready = self.runtime.weights_path.exists()
-        detector_health: dict[str, Any] = {}
-        if weights_ready:
-            detector = YoloMarkDetector(self.runtime.weights_path)
-            detector_health = detector.health()
-            detector.release()
-            weights_ready = detector_health.get("status") == "online"
         self.yolo_status.setStyleSheet(
-            f"color: {'#117d65' if weights_ready else '#a86b00'}; font-weight: 600;"
+            f"color: {'#117d65' if ready else '#a86b00'}; font-weight: 600;"
         )
         self.yolo_status.setText(
-            f"● {self.tr('yolo_ready')} — {detector_health.get('provider', '')}\n"
-            f"{detector_health.get('warning') or self.runtime.weights_path}"
-            if weights_ready
-            else f"● {self.tr('qwen_only')}\n{detector_health.get('error') or ''}"
+            (
+                f"● {self.tr('yolo_ready')}\n"
+                "Primary → verifier → cropped adjudication → reasonableness\n"
+                "Recommended: Q4 · 16k context · Flash Attention · KV cache in RAM"
+                if ready
+                else f"● {self.tr('qwen_only')}"
+            )
         )
         self.start_button.setEnabled(ready and not self._busy())
         if self.runtime:
@@ -675,7 +680,7 @@ class MainWindow(QMainWindow):
         sources = list(self.paths)
         review = self.review_checkbox.isChecked()
         vision_id = str(self.vision_combo.currentData())
-        judge_id = str(self.judge_combo.currentData())
+        verifier_id = str(self.judge_combo.currentData())
         discovery = self.discovery
 
         def prepare(runner: LocalBatchRunner):
@@ -685,7 +690,8 @@ class MainWindow(QMainWindow):
                 discovery,
                 review_groups=review,
                 extractor_model_id=vision_id,
-                judge_model_id=judge_id,
+                verifier_model_id=verifier_id,
+                judge_model_id=vision_id,
             )
             if review:
                 return "prepared", batch_id

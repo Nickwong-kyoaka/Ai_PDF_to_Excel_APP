@@ -79,6 +79,20 @@ def create_runtime(base_url: str) -> DesktopRuntime:
             connection.exec_driver_sql("ALTER TABLE local_batch_items ADD COLUMN finished_at DATETIME")
         if "output_path" not in columns:
             connection.exec_driver_sql("ALTER TABLE local_batch_items ADD COLUMN output_path TEXT")
+        batch_columns = {
+            str(row[1])
+            for row in connection.exec_driver_sql("PRAGMA table_info(local_batches)").fetchall()
+        }
+        if "verifier_model_id" not in batch_columns:
+            connection.exec_driver_sql("ALTER TABLE local_batches ADD COLUMN verifier_model_id VARCHAR(255)")
+        answer_columns = {
+            str(row[1])
+            for row in connection.exec_driver_sql("PRAGMA table_info(answers)").fetchall()
+        }
+        if "verifier_value" not in answer_columns:
+            connection.exec_driver_sql("ALTER TABLE answers ADD COLUMN verifier_value JSON")
+        if "verifier_model_id" not in answer_columns:
+            connection.exec_driver_sql("ALTER TABLE answers ADD COLUMN verifier_model_id VARCHAR(255)")
     sessions = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
     packaged_weights = resource_path("models/questionnaire_marks.onnx")
     user_weights = models / "questionnaire_marks.onnx"

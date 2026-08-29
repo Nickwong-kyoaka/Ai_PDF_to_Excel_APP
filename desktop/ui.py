@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -39,14 +40,21 @@ from backend.app.documents import ProposedGroup, validate_group_partition
 from . import __version__
 from .group_series import build_fixed_size_series, clone_page_pattern, numbered_participant_ids
 from .model_discovery import DiscoveryResult, discover_models
-from .runner import ALLOWED_SUFFIXES, GroupDraft, LocalBatchRunner, RunnerEvent
+from .runner import (
+    ALLOWED_SUFFIXES,
+    GroupDraft,
+    LocalBatchRunner,
+    RunnerEvent,
+    normalize_series_label,
+    series_workbook_filename,
+)
 from .runtime import DesktopRuntime, create_runtime
 
 
 TEXT = {
     "en": {
         "title": "FormSight Local",
-        "subtitle": "Batch input → one corresponding Excel workbook per file",
+        "subtitle": "Batch PDFs → one consolidated Excel workbook per series label",
         "step_models": "1  MODELS",
         "step_files": "2  FILES",
         "step_groups": "3  GROUP & OUTPUT",
@@ -61,6 +69,7 @@ TEXT = {
         "clear": "Clear",
         "up": "Move Up",
         "down": "Move Down",
+        "set_label": "Set Series Label",
         "files": "Input questionnaires",
         "output": "Output folder",
         "browse": "Browse…",
@@ -80,21 +89,23 @@ TEXT = {
         "path": "Location",
         "status": "Status",
         "workbook": "Output workbook",
+        "series_label": "Series label",
         "drop_hint": "Drop files or folders anywhere in this window",
         "file_summary_empty": "No questionnaires added yet",
-        "file_summary": "{count} input file(s) → {count} separate Excel workbook(s)",
-        "output_hint": "Each source file gets its own workbook. PDFs may contain several questionnaire groups.",
+        "file_summary": "{count} input file(s) → {series} labelled series workbook(s)",
+        "output_hint": "PDFs with the same series label are combined into one workbook; each PDF may contain one or many questionnaires.",
+        "label_help": "Select one or more rows, then assign the same label to combine them.",
         "log": "Run log",
         "select_files": "Select questionnaires",
         "select_folder": "Select a folder",
         "select_output": "Choose the folder for the Excel workbooks",
         "need_files": "Add at least one questionnaire file.",
         "need_output": "Choose an output folder.",
-        "completed": "The separate Excel workbooks are ready.",
+        "completed": "The labelled series Excel workbooks are ready.",
     },
     "zh": {
         "title": "FormSight 本機版",
-        "subtitle": "批量輸入 → 每個檔案各自輸出一個 Excel 活頁簿",
+        "subtitle": "批量 PDF → 每個系列標籤合併輸出一個 Excel 活頁簿",
         "step_models": "1  模型",
         "step_files": "2  檔案",
         "step_groups": "3  分組及輸出",
@@ -109,6 +120,7 @@ TEXT = {
         "clear": "清除",
         "up": "上移",
         "down": "下移",
+        "set_label": "設定系列標籤",
         "files": "輸入問卷",
         "output": "輸出資料夾",
         "browse": "瀏覽…",
@@ -128,17 +140,19 @@ TEXT = {
         "path": "位置",
         "status": "狀態",
         "workbook": "輸出活頁簿",
+        "series_label": "系列標籤",
         "drop_hint": "可將檔案或資料夾拖放到此視窗任何位置",
         "file_summary_empty": "尚未加入問卷",
-        "file_summary": "{count} 個輸入檔案 → {count} 個獨立 Excel 活頁簿",
-        "output_hint": "每個來源檔案各自輸出活頁簿；同一 PDF 可包含多個問卷分組。",
+        "file_summary": "{count} 個輸入檔案 → {series} 個系列 Excel 活頁簿",
+        "output_hint": "相同系列標籤的 PDF 會合併至同一活頁簿；每個 PDF 可包含一份或多份問卷。",
+        "label_help": "選取一列或多列，再設定相同標籤即可合併輸出。",
         "log": "執行記錄",
         "select_files": "選擇問卷",
         "select_folder": "選擇資料夾",
         "select_output": "選擇 Excel 活頁簿輸出資料夾",
         "need_files": "請加入至少一個問卷檔案。",
         "need_output": "請選擇輸出資料夾。",
-        "completed": "各檔案對應的 Excel 活頁簿已完成。",
+        "completed": "各系列標籤對應的 Excel 活頁簿已完成。",
     },
 }
 
@@ -535,6 +549,9 @@ class MainWindow(QMainWindow):
         self.current_batch_id: str | None = None
         self.output_ready: Path | None = None
         self.paths: list[Path] = []
+        self.series_labels: list[str] = []
+        self._refreshing_files = False
+        self._resume_prompted = False
         self.setMinimumSize(1180, 800)
         self.setAcceptDrops(True)
         self._build_ui()
@@ -609,9 +626,11 @@ class MainWindow(QMainWindow):
         self.clear_button = QPushButton()
         self.up_button = QPushButton()
         self.down_button = QPushButton()
+        self.set_label_button = QPushButton()
         for button in (
             self.add_files_button,
             self.add_folder_button,
+            self.set_label_button,
             self.remove_button,
             self.clear_button,
             self.up_button,
@@ -621,27 +640,38 @@ class MainWindow(QMainWindow):
         self.add_files_button.clicked.connect(self.add_files)
         self.add_folder_button.clicked.connect(self.add_folder)
         self.remove_button.clicked.connect(self.remove_selected)
+        self.set_label_button.clicked.connect(self.set_selected_series_label)
         self.clear_button.clicked.connect(self.clear_files)
         self.up_button.clicked.connect(lambda: self.move_selected(-1))
         self.down_button.clicked.connect(lambda: self.move_selected(1))
         outer.addLayout(file_header)
 
-        self.file_table = QTableWidget(0, 5)
+        self.file_table = QTableWidget(0, 6)
         self.file_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.file_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.file_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.file_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
         self.file_table.setAlternatingRowColors(True)
         self.file_table.verticalHeader().setVisible(False)
         self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.file_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.file_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.file_table.itemChanged.connect(self._series_label_edited)
         outer.addWidget(self.file_table, 2)
         file_footer = QHBoxLayout()
         self.file_summary_label = QLabel()
         self.file_summary_label.setObjectName("summary")
         self.drop_hint_label = QLabel()
         self.drop_hint_label.setObjectName("muted")
+        self.label_help_label = QLabel()
+        self.label_help_label.setObjectName("muted")
         file_footer.addWidget(self.file_summary_label)
+        file_footer.addSpacing(16)
+        file_footer.addWidget(self.label_help_label)
         file_footer.addStretch()
         file_footer.addWidget(self.drop_hint_label)
         outer.addLayout(file_footer)
@@ -769,6 +799,7 @@ class MainWindow(QMainWindow):
         self.clear_button.setText(self.tr("clear"))
         self.up_button.setText(self.tr("up"))
         self.down_button.setText(self.tr("down"))
+        self.set_label_button.setText(self.tr("set_label"))
         self.output_label.setText(self.tr("output"))
         self.output_browse_button.setText(self.tr("browse"))
         self.review_checkbox.setText(self.tr("review"))
@@ -777,9 +808,17 @@ class MainWindow(QMainWindow):
         self.open_button.setText(self.tr("open"))
         self.log_label.setText(self.tr("log"))
         self.drop_hint_label.setText(self.tr("drop_hint"))
+        self.label_help_label.setText(self.tr("label_help"))
         self.output_hint_label.setText(self.tr("output_hint"))
         self.file_table.setHorizontalHeaderLabels(
-            [self.tr("source"), self.tr("type"), self.tr("path"), self.tr("workbook"), self.tr("status")]
+            [
+                self.tr("source"),
+                self.tr("type"),
+                self.tr("series_label"),
+                self.tr("path"),
+                self.tr("workbook"),
+                self.tr("status"),
+            ]
         )
         self._update_file_summary()
         if self.discovery:
@@ -853,6 +892,23 @@ class MainWindow(QMainWindow):
                     self._log(f"Purged {removed} expired local batch(es).")
             except Exception as exc:
                 self._log(f"Retention cleanup warning: {exc}")
+            if ready and not self._resume_prompted:
+                self._resume_prompted = True
+                resumable = LocalBatchRunner(self.runtime).latest_resumable_batch()
+                if resumable:
+                    QTimer.singleShot(0, self._offer_crash_resume)
+
+    def _offer_crash_resume(self) -> None:
+        if self._busy():
+            return
+        choice = QMessageBox.question(
+            self,
+            "Resume unfinished batch / 恢復未完成批次",
+            "An unfinished batch was recovered. Completed pages and series workbooks are checkpointed. "
+            "Resume now?\n已找到未完成批次；已完成頁面及系列活頁簿均已保存。現在恢復？",
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            self.resume_last_batch()
 
     def add_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -889,35 +945,109 @@ class MainWindow(QMainWindow):
             if resolved.suffix.casefold() not in ALLOWED_SUFFIXES or str(resolved).casefold() in existing:
                 continue
             self.paths.append(resolved)
+            self.series_labels.append(self._default_series_label(resolved.stem))
             existing.add(str(resolved).casefold())
         if self.paths and not self.output_edit.text().strip():
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             self.output_edit.setText(str(Path.home() / "Documents" / f"FormSight Output {stamp}"))
         self._refresh_file_table()
 
+    def _default_series_label(self, stem: str) -> str:
+        base = normalize_series_label(stem)
+        existing = {label.casefold() for label in self.series_labels}
+        if base.casefold() not in existing:
+            return base
+        suffix = 2
+        while f"{base} #{suffix}".casefold() in existing:
+            suffix += 1
+        return f"{base} #{suffix}"
+
     def _refresh_file_table(self) -> None:
+        self._refreshing_files = True
         self.file_table.setRowCount(0)
-        for path in self.paths:
+        palette = ("#d9f1ea", "#e7e3f7", "#fae8ce", "#dcebf7", "#f5dfe7", "#e7efd5")
+        label_colors: dict[str, str] = {}
+        for index, path in enumerate(self.paths):
             row = self.file_table.rowCount()
             self.file_table.insertRow(row)
-            workbook_name = f"{path.stem}_FormSight.xlsx"
+            label = self.series_labels[index]
+            workbook_name = series_workbook_filename(label)
             values = [
                 path.name,
                 path.suffix.upper().lstrip("."),
+                label,
                 str(path.parent),
                 workbook_name,
                 "Pending / 待處理",
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setToolTip(str(path) if column in {0, 2} else value)
+                item.setToolTip(str(path) if column in {0, 3} else value)
+                if column != 2:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                else:
+                    label_key = label.casefold()
+                    if label_key not in label_colors:
+                        label_colors[label_key] = palette[len(label_colors) % len(palette)]
+                    item.setBackground(QColor(label_colors[label_key]))
+                    item.setToolTip(
+                        f"Same label = same workbook / 相同標籤 = 同一活頁簿\n{workbook_name}"
+                    )
                 self.file_table.setItem(row, column, item)
+        self._refreshing_files = False
         self._update_file_summary()
+
+    def set_selected_series_label(self) -> None:
+        rows = sorted({index.row() for index in self.file_table.selectedIndexes()})
+        if not rows and self.file_table.currentRow() >= 0:
+            rows = [self.file_table.currentRow()]
+        if not rows:
+            QMessageBox.information(
+                self,
+                self.tr("title"),
+                "Select one or more files first. / 請先選取一個或多個檔案。",
+            )
+            return
+        initial = self.series_labels[rows[0]] if len(rows) == 1 else "Series 1"
+        value, accepted = QInputDialog.getText(
+            self,
+            "Series label / 系列標籤",
+            "All selected PDFs will be combined into this Excel label:\n所有已選 PDF 將按此標籤合併輸出：",
+            text=initial,
+        )
+        if not accepted:
+            return
+        try:
+            label = normalize_series_label(value)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid label / 標籤無效", str(exc))
+            return
+        for row in rows:
+            if 0 <= row < len(self.series_labels):
+                self.series_labels[row] = label
+        self._refresh_file_table()
+        for row in rows:
+            self.file_table.selectRow(row)
+
+    def _series_label_edited(self, item: QTableWidgetItem) -> None:
+        if self._refreshing_files or item.column() != 2 or not (0 <= item.row() < len(self.series_labels)):
+            return
+        try:
+            self.series_labels[item.row()] = normalize_series_label(item.text())
+        except ValueError:
+            item.setText(self.series_labels[item.row()])
+            return
+        current_row = item.row()
+        self._refresh_file_table()
+        self.file_table.selectRow(current_row)
 
     def _update_file_summary(self) -> None:
         count = len(self.paths)
+        series_count = len({label.casefold() for label in self.series_labels})
         self.file_summary_label.setText(
-            self.tr("file_summary").format(count=count) if count else self.tr("file_summary_empty")
+            self.tr("file_summary").format(count=count, series=series_count)
+            if count
+            else self.tr("file_summary_empty")
         )
         self.start_button.setText(f"{self.tr('start')} · {count}" if count else self.tr("start"))
         ready = bool(self.discovery and self.discovery.status == "ready")
@@ -928,10 +1058,12 @@ class MainWindow(QMainWindow):
         for row in rows:
             if 0 <= row < len(self.paths):
                 self.paths.pop(row)
+                self.series_labels.pop(row)
         self._refresh_file_table()
 
     def clear_files(self) -> None:
         self.paths.clear()
+        self.series_labels.clear()
         self._refresh_file_table()
 
     def move_selected(self, direction: int) -> None:
@@ -940,6 +1072,10 @@ class MainWindow(QMainWindow):
         if row < 0 or not (0 <= target < len(self.paths)):
             return
         self.paths[row], self.paths[target] = self.paths[target], self.paths[row]
+        self.series_labels[row], self.series_labels[target] = (
+            self.series_labels[target],
+            self.series_labels[row],
+        )
         self._refresh_file_table()
         self.file_table.selectRow(target)
 
@@ -982,6 +1118,7 @@ class MainWindow(QMainWindow):
                 extractor_model_id=vision_id,
                 verifier_model_id=verifier_id,
                 judge_model_id=vision_id,
+                series_labels=list(self.series_labels),
             )
             if review:
                 return "prepared", batch_id
@@ -1023,7 +1160,7 @@ class MainWindow(QMainWindow):
         self.progress.setFormat(f"{event.progress:.0%} — {event.message}")
         self._log(event.message)
         if event.source_index is not None and 0 <= event.source_index < self.file_table.rowCount():
-            self.file_table.item(event.source_index, 4).setText(event.message)
+            self.file_table.item(event.source_index, 5).setText(event.message)
 
     def _handle_success(self, result: Any) -> None:
         self._set_busy(False)
@@ -1095,7 +1232,9 @@ class MainWindow(QMainWindow):
             text = str(item["status"])
             if item.get("error"):
                 text += f" — {item['error']}"
-            cell = self.file_table.item(row, 4)
+            if item.get("output_path"):
+                self.file_table.item(row, 4).setText(Path(str(item["output_path"])).name)
+            cell = self.file_table.item(row, 5)
             cell.setText(text)
             if item["status"] == "failed":
                 cell.setForeground(QColor("#b42318"))
@@ -1112,6 +1251,8 @@ class MainWindow(QMainWindow):
             self.clear_button,
             self.up_button,
             self.down_button,
+            self.set_label_button,
+            self.file_table,
             self.output_browse_button,
             self.review_checkbox,
             self.vision_combo,

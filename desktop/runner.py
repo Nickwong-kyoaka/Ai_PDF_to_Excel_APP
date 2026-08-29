@@ -18,7 +18,7 @@ from backend.app.scanner.extractor import QuestionnaireExtractor
 from backend.app.scanner.grouping import visual_grouping
 from backend.app.scanner.lmstudio import LMStudioGateway
 
-from .exporter import write_source_excel
+from .exporter import write_series_excel
 from .model_discovery import DiscoveryResult
 from .runtime import DesktopRuntime, ensure_local_identity
 
@@ -54,6 +54,17 @@ ProgressCallback = Callable[[RunnerEvent], None]
 def _safe_filename(value: str) -> str:
     cleaned = re.sub(r"[^\w.()\[\] -]+", "_", Path(value).name, flags=re.UNICODE).strip(" .")
     return cleaned[:180] or "questionnaire"
+
+
+def normalize_series_label(value: str) -> str:
+    cleaned = " ".join(str(value).replace("\x00", "").split()).strip(" .")
+    if not cleaned:
+        raise ValueError("Every input needs a series label")
+    return cleaned[:120]
+
+
+def series_workbook_filename(label: str) -> str:
+    return f"{_safe_filename(normalize_series_label(label))}_FormSight.xlsx"
 
 
 def _sha256(path: Path) -> str:
@@ -94,6 +105,7 @@ class LocalBatchRunner:
         extractor_model_id: str | None = None,
         verifier_model_id: str | None = None,
         judge_model_id: str | None = None,
+        series_labels: Iterable[str] | None = None,
     ) -> str:
         source_paths: list[Path] = []
         seen: set[str] = set()
@@ -126,16 +138,41 @@ class LocalBatchRunner:
             child.name.casefold() for child in output.iterdir() if child.is_file()
         }
 
-        output_paths: list[Path] = []
-        for source in source_paths:
-            stem = _safe_filename(source.stem)
+        supplied_labels = list(series_labels) if series_labels is not None else None
+        if supplied_labels is not None and len(supplied_labels) != len(source_paths):
+            raise ValueError("Series labels must match the selected source-file order")
+
+        if supplied_labels is None:
+            # Preserve the historic one-input/one-workbook default while assigning stable labels.
+            labels: list[str] = []
+            label_counts: dict[str, int] = {}
+            for source in source_paths:
+                base = normalize_series_label(source.stem)
+                key = base.casefold()
+                label_counts[key] = label_counts.get(key, 0) + 1
+                labels.append(base if label_counts[key] == 1 else f"{base}_{label_counts[key]}")
+        else:
+            labels = [normalize_series_label(value) for value in supplied_labels]
+
+        canonical_labels: dict[str, str] = {}
+        labels = [
+            canonical_labels.setdefault(label.casefold(), label)
+            for label in labels
+        ]
+
+        label_outputs: dict[str, Path] = {}
+        for label in labels:
+            key = label.casefold()
+            if key in label_outputs:
+                continue
+            stem = _safe_filename(label)
             candidate = output / f"{stem}_FormSight.xlsx"
             suffix = 2
             while candidate.name.casefold() in reserved_outputs:
                 candidate = output / f"{stem}_FormSight_{suffix}.xlsx"
                 suffix += 1
             reserved_outputs.add(candidate.name.casefold())
-            output_paths.append(candidate)
+            label_outputs[key] = candidate
         batch_id = new_id()
         batch_root = self.runtime.settings.data_dir / "batches" / batch_id
         uploads_root = batch_root / "uploads"
@@ -166,7 +203,8 @@ class LocalBatchRunner:
                         order_index=index,
                         original_path=str(source),
                         stored_path=str(destination),
-                        output_path=str(output_paths[index]),
+                        series_label=labels[index],
+                        output_path=str(label_outputs[labels[index].casefold()]),
                         status="pending",
                     )
                 )
@@ -394,14 +432,24 @@ class LocalBatchRunner:
             batch.stage_message = "Scanning sequentially / 正在依次掃描"
             db.commit()
 
-            results: list[dict[str, object]] = []
+            results_by_label: dict[str, dict[str, object]] = {}
             for item_index, item in enumerate(items):
                 if self.cancel_event.is_set():
                     self._pause(db, batch, item)
                     return None
 
                 if item.status == "completed":
-                    results.append(self._write_item_workbook(db, batch, item))
+                    try:
+                        result = self._write_series_workbook(db, batch, item.series_label)
+                        results_by_label[item.series_label.casefold()] = result
+                    except Exception as exc:
+                        self._emit(
+                            batch.id,
+                            "checkpoint_warning",
+                            batch.progress,
+                            f"Series checkpoint delayed: {str(exc)[:160]}",
+                            item_index,
+                        )
                     continue
                 job = db.get(Job, item.job_id) if item.job_id else None
                 if not job:
@@ -409,7 +457,17 @@ class LocalBatchRunner:
                     item.error = item.error or "Prepared job is missing"
                     item.finished_at = item.finished_at or utcnow()
                     db.commit()
-                    results.append(self._write_item_workbook(db, batch, item))
+                    try:
+                        result = self._write_series_workbook(db, batch, item.series_label)
+                        results_by_label[item.series_label.casefold()] = result
+                    except Exception as exc:
+                        self._emit(
+                            batch.id,
+                            "checkpoint_warning",
+                            batch.progress,
+                            f"Series checkpoint delayed: {str(exc)[:160]}",
+                            item_index,
+                        )
                     continue
 
                 item.status = "running"
@@ -466,26 +524,59 @@ class LocalBatchRunner:
                 export_progress = 0.12 + ((item_index + 0.95) / max(1, len(items))) * 0.86
                 batch.status = "exporting"
                 batch.progress = export_progress
-                batch.stage_message = f"Creating Excel for {Path(item.original_path).name}"
+                batch.stage_message = f"Checkpointing series: {item.series_label}"
                 db.commit()
                 self._emit(batch.id, "exporting", export_progress, batch.stage_message, item_index)
                 try:
-                    results.append(self._write_item_workbook(db, batch, item))
+                    result = self._write_series_workbook(db, batch, item.series_label)
+                    results_by_label[item.series_label.casefold()] = result
                 except Exception as exc:
-                    previous = item.error
-                    item.status = "export_failed"
-                    item.error = f"{previous}; Excel export failed: {exc}" if previous else f"Excel export failed: {exc}"
-                    item.error = item.error[:2000]
+                    self._emit(
+                        batch.id,
+                        "checkpoint_warning",
+                        export_progress,
+                        f"Series checkpoint delayed; final export will retry: {str(exc)[:160]}",
+                        item_index,
+                    )
+
+            # Rebuild every series once after all of its sources are terminal. Each earlier
+            # per-source export is only a crash-safe partial checkpoint.
+            final_export_errors: dict[str, str] = {}
+            unique_labels = list(dict.fromkeys(item.series_label for item in items))
+            for label_index, label in enumerate(unique_labels):
+                try:
+                    result = self._write_series_workbook(db, batch, label)
+                    results_by_label[label.casefold()] = result
+                except Exception as exc:
+                    final_export_errors[label.casefold()] = str(exc)[:1000]
+                    for series_item in items:
+                        if series_item.series_label.casefold() == label.casefold():
+                            previous = series_item.error
+                            series_item.status = "export_failed"
+                            series_item.error = (
+                                f"{previous}; Excel export failed: {exc}"
+                                if previous
+                                else f"Excel export failed: {exc}"
+                            )[:2000]
                     db.commit()
+                final_progress = 0.98 + ((label_index + 1) / max(1, len(unique_labels))) * 0.019
+                self._emit(batch.id, "exporting", final_progress, f"Finalizing series: {label}")
 
             failed = sum(item.status in {"failed", "export_failed"} for item in items)
+            results = list(results_by_label.values())
             flags = sum(int(result.get("flags", 0)) for result in results)
             status_label = "COMPLETED — FLAGS PRESENT" if failed or flags else "COMPLETED"
-            batch.status = "completed"
+            if final_export_errors:
+                status_label = "EXPORT FAILED — RESUME AVAILABLE"
+            batch.status = "export_failed" if final_export_errors else "completed"
             batch.progress = 1.0
             batch.stage_message = status_label
-            batch.completed_at = utcnow()
-            batch.error = None
+            batch.completed_at = None if final_export_errors else utcnow()
+            batch.error = (
+                "; ".join(f"{label}: {error}" for label, error in final_export_errors.items())[:2000]
+                if final_export_errors
+                else None
+            )
             db.commit()
             self._emit(batch.id, "completed", 1.0, batch.stage_message)
             paths = [str(result["path"]) for result in results if result.get("path")]
@@ -499,39 +590,56 @@ class LocalBatchRunner:
                 "flags": flags,
             }
 
-    def _write_item_workbook(
+    def _write_series_workbook(
         self,
         db,
         batch: LocalBatch,
-        item: LocalBatchItem,
+        series_label: str,
     ) -> dict[str, object]:
-        if not item.output_path:
+        items = list(
+            db.scalars(
+                select(LocalBatchItem)
+                .where(
+                    LocalBatchItem.batch_id == batch.id,
+                    LocalBatchItem.series_label == series_label,
+                )
+                .order_by(LocalBatchItem.order_index.asc())
+            ).all()
+        )
+        if not items:
+            raise ValueError(f"Series not found: {series_label}")
+        output_path = next((item.output_path for item in items if item.output_path), None)
+        if not output_path:
             output_directory = Path(batch.output_path)
             if output_directory.suffix.casefold() == ".xlsx":
                 output_directory = output_directory.parent
             output_directory.mkdir(parents=True, exist_ok=True)
-            item.output_path = str(
-                output_directory / f"{_safe_filename(Path(item.original_path).stem)}_FormSight.xlsx"
-            )
-            db.commit()
-        return write_source_excel(db, batch, item, item.output_path)
+            output_path = str(output_directory / series_workbook_filename(series_label))
+        for item in items:
+            item.output_path = output_path
+        db.commit()
+        return write_series_excel(db, batch, items, series_label, output_path)
 
     def _pause(self, db, batch: LocalBatch, current_item: LocalBatchItem) -> None:
         current_item.status = "paused"
-        current_item.error = "Paused by user; this input will restart from page 1 when resumed."
+        current_item.error = "Paused by user; completed pages are checkpointed and will be skipped on resume."
         batch.status = "paused"
         batch.stage_message = "Paused — completed inputs are preserved / 已暫停，完成的檔案已保留"
         db.commit()
         self._emit(batch.id, "paused", batch.progress, batch.stage_message, current_item.order_index)
 
-    def resume_batch(self, batch_id: str) -> dict[str, object] | None:
+    def resume_batch(self, batch_id: str) -> dict[str, object] | tuple[str, str] | None:
         with self.runtime.sessions() as db:
             batch = db.get(LocalBatch, batch_id)
             if not batch:
                 raise ValueError("Local batch not found")
+            resume_preparation = batch.status == "preparing"
             items = list(db.scalars(select(LocalBatchItem).where(LocalBatchItem.batch_id == batch.id)).all())
             for item in items:
-                if item.status == "paused":
+                if resume_preparation and not item.job_id:
+                    item.status = "pending"
+                    item.error = None
+                elif item.status in {"paused", "running", "export_failed"}:
                     item.status = "queued"
                     item.error = None
                     if item.job_id:
@@ -542,13 +650,31 @@ class LocalBatchRunner:
             batch.status = "queued"
             batch.error = None
             db.commit()
+        if resume_preparation:
+            self.prepare_batch(batch_id)
+            with self.runtime.sessions() as db:
+                batch = db.get(LocalBatch, batch_id)
+                if batch and batch.status == "awaiting_confirmation":
+                    return "prepared", batch_id
         return self.execute_batch(batch_id)
 
     def latest_resumable_batch(self) -> str | None:
         with self.runtime.sessions() as db:
             batch = db.scalar(
                 select(LocalBatch)
-                .where(LocalBatch.status.in_({"paused", "export_failed", "queued", "awaiting_confirmation"}))
+                .where(
+                    LocalBatch.status.in_(
+                        {
+                            "preparing",
+                            "running",
+                            "exporting",
+                            "paused",
+                            "export_failed",
+                            "queued",
+                            "awaiting_confirmation",
+                        }
+                    )
+                )
                 .order_by(LocalBatch.updated_at.desc())
             )
             return batch.id if batch else None
@@ -579,6 +705,7 @@ class LocalBatchRunner:
                     {
                         "index": item.order_index,
                         "source": item.original_path,
+                        "series_label": item.series_label,
                         "output_path": item.output_path,
                         "status": item.status,
                         "error": item.error,

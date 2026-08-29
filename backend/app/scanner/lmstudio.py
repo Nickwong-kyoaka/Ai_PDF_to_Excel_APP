@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import re
+import time
 from typing import Any
 
 import httpx
@@ -146,6 +147,25 @@ class LMStudioGateway:
                         response = client.post(
                             f"{self.base_url}/chat/completions", headers=self.headers, json=payload
                         )
+                    error_text = response.text.casefold() if response.status_code >= 400 else ""
+                    context_limited = response.status_code in {400, 413, 422} and any(
+                        phrase in error_text
+                        for phrase in (
+                            "context length",
+                            "context window",
+                            "maximum context",
+                            "max_tokens",
+                            "too many tokens",
+                            "token limit",
+                        )
+                    )
+                    if context_limited and int(payload["max_tokens"]) > 1024:
+                        payload["max_tokens"] = max(1024, int(payload["max_tokens"]) // 2)
+                        last_error = RuntimeError(
+                            f"LM Studio context limit; retrying with max_tokens={payload['max_tokens']}"
+                        )
+                        if attempt < retries:
+                            continue
                     response.raise_for_status()
                     message = response.json()["choices"][0]["message"]
                     raw = message.get("content") or message.get("final") or ""
@@ -154,4 +174,5 @@ class LMStudioGateway:
                     last_error = exc
                     if attempt == retries:
                         break
+                    time.sleep(min(6.0, 1.5 * (2**attempt)))
         raise RuntimeError(f"LM Studio request failed: {last_error}")

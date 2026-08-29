@@ -70,6 +70,26 @@ def sanitize_item(item: dict[str, Any], fallback_id: str) -> dict[str, Any]:
     }
 
 
+def chunk_judge_records(
+    records: list[dict[str, Any]], *, max_items: int = 24, max_json_chars: int = 16000
+) -> list[list[dict[str, Any]]]:
+    """Keep reasonableness prompts below small local-model context limits."""
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_chars = 0
+    for record in records:
+        size = len(json.dumps(record, ensure_ascii=False, default=str))
+        if current and (len(current) >= max_items or current_chars + size > max_json_chars):
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(record)
+        current_chars += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 class QuestionnaireExtractor:
     def __init__(
         self,
@@ -119,17 +139,44 @@ class QuestionnaireExtractor:
         include_tiles: bool,
         model_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        evidence_images = [image]
-        if include_tiles:
-            evidence_images.extend(self.legacy.zoom_tiles(image, max_tiles=4))
-        response = self.gateway.chat_json(
-            model=model_id or self.profile["extractor_model_id"],
-            prompt=extraction_prompt(page_number, total_pages, pass_name),
-            images=evidence_images,
-            max_tokens=8192,
-            retries=2,
-        )
+        selected_model = model_id or self.profile["extractor_model_id"]
+        prompt = extraction_prompt(page_number, total_pages, pass_name)
+        response: dict[str, Any] = {}
+        full_page_error: Exception | None = None
+        try:
+            # One image per request keeps visual tokens bounded on 8k/16k local contexts.
+            response = self.gateway.chat_json(
+                model=selected_model,
+                prompt=prompt,
+                images=[image],
+                max_tokens=4096,
+                retries=2,
+            )
+        except Exception as exc:
+            full_page_error = exc
+
         items = response.get("items")
+        if include_tiles and (full_page_error or not isinstance(items, list) or not items):
+            items = []
+            tile_errors: list[str] = []
+            for tile_number, tile in enumerate(self.legacy.zoom_tiles(image, max_tiles=4), start=1):
+                try:
+                    tile_response = self.gateway.chat_json(
+                        model=selected_model,
+                        prompt=f"{prompt}\nThis is zoom region {tile_number}; return only questions visible in this region.",
+                        images=[tile],
+                        max_tokens=3072,
+                        retries=1,
+                    )
+                    tile_items = tile_response.get("items")
+                    if isinstance(tile_items, list):
+                        items.extend(tile_items)
+                except Exception as exc:
+                    tile_errors.append(str(exc)[:160])
+            if not items and full_page_error:
+                raise RuntimeError(
+                    f"Full-page request failed ({full_page_error}); zoom fallback failed ({tile_errors})"
+                ) from full_page_error
         if not isinstance(items, list):
             raise ValueError("Extractor JSON omitted the items array")
         return [
@@ -175,8 +222,13 @@ class QuestionnaireExtractor:
         page_number: int,
         total_pages: int,
         yolo_available: bool,
+        image_max_side: int | None = None,
     ) -> tuple[list[FusedAnswer], dict[str, Any]]:
-        image = render_page(source, page_number, int(self.profile.get("image_max_side", 3000)))
+        image = render_page(
+            source,
+            page_number,
+            image_max_side or int(self.profile.get("image_max_side", 3000)),
+        )
         image = self.orient(self.legacy.enhance(image))
         primary_model_id = self.profile["extractor_model_id"]
         verifier_model_id = self.profile.get("verifier_model_id")
@@ -236,8 +288,6 @@ class QuestionnaireExtractor:
     def extract_job(self, db: Session, job: Job) -> None:
         if self.manage_models:
             self.gateway.manage_model("load", self.profile["extractor_model_id"])
-        db.execute(delete(Answer).where(Answer.job_id == job.id))
-        db.commit()
         source = Path(job.stored_path)
         groups = db.scalars(
             select(QuestionnaireGroup)
@@ -251,6 +301,16 @@ class QuestionnaireExtractor:
         debug_dir = self.settings.artifacts_dir / job.id / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
         page_failures: list[dict[str, Any]] = []
+        existing_answers = list(db.scalars(select(Answer).where(Answer.job_id == job.id)).all())
+        existing_by_page: dict[int, list[Answer]] = {}
+        for answer in existing_answers:
+            existing_by_page.setdefault(answer.page_number, []).append(answer)
+        completed_pages = {
+            page_number
+            for page_number, answers in existing_by_page.items()
+            if answers
+            and not any(answer.question_id.startswith("PAGE-") and answer.question_id.endswith("-EXTRACTION-ERROR") for answer in answers)
+        }
 
         for group in groups:
             for page_number in range(group.start_page, group.end_page + 1):
@@ -260,15 +320,54 @@ class QuestionnaireExtractor:
                     job.stage_message = "Cancelled by user"
                     db.commit()
                     return
+                if page_number in completed_pages:
+                    processed += 1
+                    job.stage_message = f"Resuming: page {page_number} already checkpointed"
+                    job.progress = (processed / max(1, total_work_pages)) * 0.72
+                    self.notify("extracting", job.progress, job.stage_message)
+                    db.commit()
+                    continue
                 job.stage_message = f"Extracting page {page_number} of {job.page_count}"
                 job.progress = (processed / max(1, total_work_pages)) * 0.72
                 self.notify("extracting", job.progress, job.stage_message)
                 db.commit()
 
-                try:
-                    fused_answers, debug_payload = self.extract_one_page(
-                        source, page_number, job.page_count, yolo_available
-                    )
+                db.execute(
+                    delete(Answer).where(Answer.job_id == job.id, Answer.page_number == page_number)
+                )
+                db.commit()
+                fused_answers: list[FusedAnswer] | None = None
+                debug_payload: dict[str, Any] = {}
+                final_error: Exception | None = None
+                max_side = int(self.profile.get("image_max_side", 3000))
+                for page_attempt, retry_side in enumerate((max_side, min(max_side, 2200)), start=1):
+                    try:
+                        fused_answers, debug_payload = self.extract_one_page(
+                            source,
+                            page_number,
+                            job.page_count,
+                            yolo_available,
+                            image_max_side=retry_side,
+                        )
+                        debug_payload["page_attempt"] = page_attempt
+                        debug_payload["checkpoint_complete"] = True
+                        final_error = None
+                        break
+                    except Exception as exc:
+                        final_error = exc
+                        debug_payload = {
+                            "page_error": str(exc),
+                            "page_attempt": page_attempt,
+                            "retry_image_max_side": retry_side,
+                        }
+                        if page_attempt == 1:
+                            self.notify(
+                                "extracting",
+                                job.progress,
+                                f"Retrying page {page_number} with a smaller image",
+                            )
+
+                if fused_answers is not None:
                     for fused in fused_answers:
                         selected = fused.item.get("selected_options") or []
                         if fused.verifier_model_id and fused.item.get("answer_type") in {
@@ -307,9 +406,9 @@ class QuestionnaireExtractor:
                                 review_status="pending" if fused.needs_review else "not_required",
                             )
                         )
-                except Exception as exc:
-                    debug_payload = {"page_error": str(exc)}
-                    page_failures.append({"page_number": page_number, "error": str(exc)})
+                else:
+                    error_text = str(final_error or "Unknown page extraction failure")
+                    page_failures.append({"page_number": page_number, "error": error_text})
                     db.add(
                         Answer(
                             job_id=job.id,
@@ -320,7 +419,7 @@ class QuestionnaireExtractor:
                             answer_type="other",
                             scanner_value=None,
                             scanner_confidence=0,
-                            fusion_reason=str(exc)[:1000],
+                            fusion_reason=error_text[:1000],
                             final_value=None,
                             final_source="scanner",
                             reasonableness_status="review_required",
@@ -366,9 +465,9 @@ class QuestionnaireExtractor:
             for answer in answers:
                 record = {
                     "question_id": answer.question_id,
-                    "question_text": answer.question_text,
+                    "question_text": answer.question_text[:1200],
                     "answer_type": answer.answer_type,
-                    "allowed_options": answer.allowed_options,
+                    "allowed_options": (answer.allowed_options or [])[:80],
                     "scanner_value": answer.scanner_value,
                 }
                 payload.append(record)
@@ -379,22 +478,39 @@ class QuestionnaireExtractor:
                     finding = evaluate_rule(answer.question_id, answer.scanner_value, definition, context)
                     if finding:
                         findings.append(finding)
-            try:
-                response = self.gateway.chat_json(
-                    model=self.profile["judge_model_id"],
-                    prompt=judge_prompt(payload, findings),
-                    max_tokens=4096,
-                    retries=2,
-                )
-                results = {
-                    str(item.get("question_id")): item
-                    for item in response.get("results", [])
-                    if isinstance(item, dict) and item.get("question_id")
-                }
-            except Exception as exc:
-                results = {}
-                for answer in answers:
-                    answer.judge_reason = f"Reasonableness model unavailable: {str(exc)[:180]}"
+            results: dict[str, dict[str, Any]] = {}
+            for chunk_index, chunk in enumerate(chunk_judge_records(payload), start=1):
+                chunk_ids = {str(record["question_id"]) for record in chunk}
+                chunk_findings = [
+                    finding
+                    for finding in findings
+                    if str(finding.get("question_id")) in chunk_ids
+                ]
+                try:
+                    self.notify(
+                        "judging",
+                        job.progress,
+                        f"Checking questionnaire {group_index + 1}, part {chunk_index}",
+                    )
+                    response = self.gateway.chat_json(
+                        model=self.profile["judge_model_id"],
+                        prompt=judge_prompt(chunk, chunk_findings),
+                        max_tokens=2048,
+                        retries=2,
+                    )
+                    results.update(
+                        {
+                            str(item.get("question_id")): item
+                            for item in response.get("results", [])
+                            if isinstance(item, dict) and item.get("question_id")
+                        }
+                    )
+                except Exception as exc:
+                    for answer in answers:
+                        if answer.question_id in chunk_ids:
+                            answer.judge_reason = (
+                                f"Reasonableness model unavailable for this chunk: {str(exc)[:180]}"
+                            )
 
             findings_by_question: dict[str, list[dict[str, Any]]] = {}
             for finding in findings:

@@ -3,7 +3,7 @@ from pathlib import Path
 from PIL import Image
 
 from app.config import Settings
-from app.scanner.extractor import QuestionnaireExtractor
+from app.scanner.extractor import QuestionnaireExtractor, chunk_judge_records
 
 
 def extracted_item(value: str = "Yes") -> dict:
@@ -85,3 +85,21 @@ def test_verifier_result_survives_primary_model_failure(tmp_path, monkeypatch):
     assert answers[0].verifier_value == "Yes"
     assert answers[0].needs_review is True
     assert "primary" in debug["model_errors"]
+
+
+def test_reasonableness_records_are_chunked_for_local_context_limits():
+    records = [
+        {
+            "question_id": f"Q{index}",
+            "question_text": "Question " + ("x" * 300),
+            "scanner_value": "Yes",
+        }
+        for index in range(55)
+    ]
+    chunks = chunk_judge_records(records, max_items=20, max_json_chars=8000)
+
+    assert len(chunks) >= 3
+    assert [record["question_id"] for chunk in chunks for record in chunk] == [
+        record["question_id"] for record in records
+    ]
+    assert all(len(chunk) <= 20 for chunk in chunks)

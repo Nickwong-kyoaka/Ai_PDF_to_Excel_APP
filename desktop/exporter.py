@@ -104,6 +104,8 @@ def _answer_row(
     group: QuestionnaireGroup,
     answer: Answer,
     language: str,
+    series_label: str,
+    series_questionnaire_index: int,
 ) -> dict[str, Any]:
     evidence = answer.evidence or []
     primary_evidence = [
@@ -113,6 +115,8 @@ def _answer_row(
     ]
     verifier_evidence = [entry for entry in evidence if entry.get("source") == "verifier_vision"]
     return {
+        "Series_Label": series_label,
+        "Series_Questionnaire_Index": series_questionnaire_index,
         "Source_File": Path(item.original_path).name,
         "Source_File_Index": item.order_index + 1,
         "Questionnaire_Index": group.group_index + 1,
@@ -148,20 +152,24 @@ def _answer_row(
     }
 
 
-def write_source_excel(
+def write_series_excel(
     db: Session,
     batch: LocalBatch,
-    item: LocalBatchItem,
+    items: list[LocalBatchItem],
+    series_label: str,
     destination: str | Path,
 ) -> dict[str, Any]:
-    """Write the workbook corresponding to one selected PDF or image."""
+    """Atomically write one workbook containing every source in a labelled series."""
+
+    if not items:
+        raise ValueError("A series workbook requires at least one source item")
+    items = sorted(items, key=lambda value: value.order_index)
 
     destination = Path(destination).expanduser().resolve()
     if destination.suffix.lower() != ".xlsx":
         destination = destination.with_suffix(".xlsx")
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    items = [item]
     item_by_job = {item.job_id: item for item in items if item.job_id}
     jobs = list(db.scalars(select(Job).where(Job.id.in_(list(item_by_job)))).all()) if item_by_job else []
     jobs.sort(key=lambda job: item_by_job[job.id].order_index)
@@ -173,6 +181,7 @@ def write_source_excel(
     reason_rows: list[dict[str, Any]] = []
     audit_rows: list[dict[str, Any]] = []
     source_stats: Counter[str] = Counter()
+    series_questionnaire_index = 0
 
     for job in jobs:
         item = item_by_job[job.id]
@@ -184,6 +193,7 @@ def write_source_excel(
             ).all()
         )
         for group in groups:
+            series_questionnaire_index += 1
             answers = list(
                 db.scalars(
                     select(Answer)
@@ -197,6 +207,8 @@ def write_source_excel(
             source_stats[source_name] += len(answers)
             questionnaire_rows.append(
                 {
+                    "Series_Label": series_label,
+                    "Series_Questionnaire_Index": series_questionnaire_index,
                     "Source_File": source_name,
                     "Source_File_Index": item.order_index + 1,
                     "Questionnaire_Index": group.group_index + 1,
@@ -210,12 +222,22 @@ def write_source_excel(
                 }
             )
             for answer in answers:
-                row = _answer_row(item=item, job=job, group=group, answer=answer, language=language)
+                row = _answer_row(
+                    item=item,
+                    job=job,
+                    group=group,
+                    answer=answer,
+                    language=language,
+                    series_label=series_label,
+                    series_questionnaire_index=series_questionnaire_index,
+                )
                 answer_rows.append(row)
                 page_rows.append(
                     {
                         key: row[key]
                         for key in (
+                            "Series_Label",
+                            "Series_Questionnaire_Index",
                             "Source_File",
                             "Source_File_Index",
                             "Questionnaire_Index",
@@ -239,6 +261,8 @@ def write_source_excel(
                     {
                         key: row[key]
                         for key in (
+                            "Series_Label",
+                            "Series_Questionnaire_Index",
                             "Source_File",
                             "Source_File_Index",
                             "Questionnaire_Index",
@@ -273,6 +297,8 @@ def write_source_excel(
                 answer = answer_by_id.get(event.answer_id)
                 audit_rows.append(
                     {
+                        "Series_Label": series_label,
+                        "Series_Questionnaire_Index": series_questionnaire_index,
                         "Source_File": source_name,
                         "Source_File_Index": item.order_index + 1,
                         "Questionnaire_Index": group.group_index + 1,
@@ -288,6 +314,7 @@ def write_source_excel(
 
     failed_rows = [
         {
+            "Series_Label": series_label,
             "Source_File": Path(item.original_path).name,
             "Source_File_Index": item.order_index + 1,
             "Status": item.status,
@@ -295,18 +322,29 @@ def write_source_excel(
             "Updated_At": item.updated_at,
         }
         for item in items
-        if item.status == "failed"
+        if item.status in {"failed", "export_failed"}
     ]
 
     unresolved = len(conflict_rows)
-    status_label = "COMPLETED — FLAGS PRESENT" if unresolved or failed_rows else "COMPLETED"
+    incomplete = sum(
+        item.status not in {"completed", "failed", "export_failed"} for item in items
+    )
+    status_label = (
+        "IN PROGRESS — PARTIAL CHECKPOINT"
+        if incomplete
+        else "COMPLETED — FLAGS PRESENT"
+        if unresolved or failed_rows
+        else "COMPLETED"
+    )
     qa_rows = [
         {"Metric": "Workbook_Status", "Value": status_label},
+        {"Metric": "Series_Label", "Value": series_label},
         {"Metric": "Source_Files", "Value": len(items)},
         {"Metric": "Questionnaires", "Value": len(questionnaire_rows)},
         {"Metric": "Answers", "Value": len(answer_rows)},
         {"Metric": "Flagged_Answers", "Value": unresolved},
         {"Metric": "Failed_Inputs", "Value": len(failed_rows)},
+        {"Metric": "Incomplete_Inputs", "Value": incomplete},
         {
             "Metric": "Qwen_Corrections_Pending_Review",
             "Value": sum(row["Final_Source"] == "qwen_judge" for row in answer_rows),
@@ -321,6 +359,7 @@ def write_source_excel(
     run_rows = [
         {
             "Batch_ID": batch.id,
+            "Series_Label": series_label,
             "Source_File": Path(item.original_path).name,
             "Source_File_Index": item.order_index + 1,
             "Status": item.status,
@@ -340,10 +379,12 @@ def write_source_excel(
     for name in SHEETS:
         wb.create_sheet(name)
     wb.properties.title = f"FormSight Local — {status_label}"
-    wb.properties.subject = f"Questionnaire extraction for {Path(item.original_path).name}"
+    wb.properties.subject = f"Questionnaire series: {series_label}"
     wb.properties.creator = "FormSight Local"
 
     questionnaire_headers = [
+        "Series_Label",
+        "Series_Questionnaire_Index",
         "Source_File",
         "Source_File_Index",
         "Questionnaire_Index",
@@ -356,6 +397,8 @@ def write_source_excel(
         "Model_Profile",
     ]
     answer_headers = [
+        "Series_Label",
+        "Series_Questionnaire_Index",
         "Source_File",
         "Source_File_Index",
         "Questionnaire_Index",
@@ -389,6 +432,8 @@ def write_source_excel(
         "Updated_At",
     ]
     page_headers = [
+        "Series_Label",
+        "Series_Questionnaire_Index",
         "Source_File",
         "Source_File_Index",
         "Questionnaire_Index",
@@ -405,6 +450,8 @@ def write_source_excel(
         "Flag_Status",
     ]
     reason_headers = [
+        "Series_Label",
+        "Series_Questionnaire_Index",
         "Source_File",
         "Source_File_Index",
         "Questionnaire_Index",
@@ -424,13 +471,18 @@ def write_source_excel(
     _write_rows(wb["Long_Answers"], answer_headers, answer_rows)
     _write_rows(wb["Page_Extracts"], page_headers, page_rows)
     _write_rows(wb["Conflicts"], answer_headers, conflict_rows)
-    _write_rows(wb["Failed_Jobs"], ["Source_File", "Source_File_Index", "Status", "Error", "Updated_At"], failed_rows)
+    _write_rows(
+        wb["Failed_Jobs"],
+        ["Series_Label", "Source_File", "Source_File_Index", "Status", "Error", "Updated_At"],
+        failed_rows,
+    )
     _write_rows(wb["QA_Summary"], ["Metric", "Value"], qa_rows)
     _write_rows(wb["Data_Analysis"], ["Source_File", "Answer_Count"], analysis_rows)
     _write_rows(
         wb["Run_Log"],
         [
             "Batch_ID",
+            "Series_Label",
             "Source_File",
             "Source_File_Index",
             "Status",
@@ -448,6 +500,8 @@ def write_source_excel(
     _write_rows(
         wb["Review_Audit"],
         [
+            "Series_Label",
+            "Series_Questionnaire_Index",
             "Source_File",
             "Source_File_Index",
             "Questionnaire_Index",
@@ -487,3 +541,20 @@ def write_source_excel(
         "flags": unresolved,
         "failed": len(failed_rows),
     }
+
+
+def write_source_excel(
+    db: Session,
+    batch: LocalBatch,
+    item: LocalBatchItem,
+    destination: str | Path,
+) -> dict[str, Any]:
+    """Backward-compatible wrapper for one-source workbooks."""
+
+    return write_series_excel(
+        db,
+        batch,
+        [item],
+        item.series_label or Path(item.original_path).stem,
+        destination,
+    )

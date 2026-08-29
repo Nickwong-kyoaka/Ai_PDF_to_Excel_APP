@@ -79,6 +79,20 @@ def create_runtime(base_url: str) -> DesktopRuntime:
             connection.exec_driver_sql("ALTER TABLE local_batch_items ADD COLUMN finished_at DATETIME")
         if "output_path" not in columns:
             connection.exec_driver_sql("ALTER TABLE local_batch_items ADD COLUMN output_path TEXT")
+        if "series_label" not in columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE local_batch_items ADD COLUMN series_label VARCHAR(160) NOT NULL DEFAULT ''"
+            )
+        legacy_items = connection.exec_driver_sql(
+            "SELECT id, original_path, order_index FROM local_batch_items "
+            "WHERE series_label IS NULL OR TRIM(series_label) = ''"
+        ).fetchall()
+        for item_id, original_path, order_index in legacy_items:
+            legacy_label = f"{Path(str(original_path)).stem} legacy {int(order_index) + 1}"
+            connection.exec_driver_sql(
+                "UPDATE local_batch_items SET series_label = ? WHERE id = ?",
+                (legacy_label[:160], str(item_id)),
+            )
         batch_columns = {
             str(row[1])
             for row in connection.exec_driver_sql("PRAGMA table_info(local_batches)").fetchall()

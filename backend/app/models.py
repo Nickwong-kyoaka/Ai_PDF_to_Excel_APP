@@ -277,6 +277,7 @@ class LocalBatchItem(Base):
     order_index: Mapped[int] = mapped_column(Integer, nullable=False)
     original_path: Mapped[str] = mapped_column(Text, nullable=False)
     stored_path: Mapped[str] = mapped_column(Text, nullable=False)
+    series_label: Mapped[str] = mapped_column(String(160), default="", nullable=False)
     output_path: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), default="pending", nullable=False)
     error: Mapped[str | None] = mapped_column(Text)

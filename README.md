@@ -2,7 +2,7 @@
 
 FormSight is a private Chinese/English questionnaire scanner for Windows model PCs. A FastAPI service stores durable jobs and audit data, a single GPU worker runs Qwen through LM Studio and a custom YOLO mark detector, and a bilingual React interface lets operators confirm page groups and reviewers approve every model correction.
 
-The repository also contains **FormSight Local**, a separate single-user PySide6 desktop edition. It has no login or web server, never asks for an API URL/token, automatically detects an already-running loopback LM Studio server, accepts multiple questionnaire files, and generates one corresponding Excel workbook for every selected input.
+The repository also contains **FormSight Local**, a separate single-user PySide6 desktop edition. It has no login or web server, never asks for an API URL/token, automatically detects an already-running loopback LM Studio server, accepts multiple questionnaire files, and consolidates every PDF carrying the same operator-assigned series label into one Excel workbook.
 
 ## FormSight Local desktop edition
 
@@ -10,13 +10,13 @@ On the destination Windows 10/11 x64 PC:
 
 1. Install LM Studio 0.4+, start its local server with the default loopback-only/authentication-off settings, and load two Q4 vision models: `qwen/qwen3-vl-8b` as the primary and `google/gemma-3-4b` as the independent verifier. For a 16 GB RTX 5060 Ti, use a 16384-token context, enable Flash Attention, and keep the KV cache in system RAM for both.
 2. Run `FormSight-Local-Setup.exe`. Python, Node.js, FastAPI, and an API key are not required on the destination PC.
-3. Launch **FormSight Local**, drag in or select any number of PDF/PNG/JPEG/single-page TIFF questionnaires, choose an output folder, optionally review PDF page groups, and start the scan. Each selected file receives a separate `<source-name>_FormSight.xlsx`; multiple questionnaires detected inside the same PDF remain together in that PDF's workbook.
+3. Launch **FormSight Local**, drag in or select any number of PDF/PNG/JPEG/single-page TIFF questionnaires, select related rows and assign the same **Series label**, choose an output folder, optionally review PDF page groups, and start the scan. All files with that label are consolidated into `<series-label>_FormSight.xlsx`; each PDF may independently contain one questionnaire or many.
 
 The page-series review works through one PDF at a time and provides one-document, one-page, and fixed-pages-per-questionnaire presets. A validated page-range pattern can be copied to every same-length PDF, participant IDs can be auto-numbered, and live validation prevents gaps or overlapping pages before scanning.
 
 The local application uses only models already loaded in LM Studio and does not download, load, or unload them. It runs the Qwen primary pass and Gemma verifier pass sequentially—never in parallel—then uses Qwen again for cropped conflict adjudication and the reasonableness check. This provides model-family diversity without keeping a third model in memory. YOLO and ONNX Runtime are no longer part of the local installer; the web-server edition retains its separate optional YOLO pipeline.
 
-Local working records and restart state are stored under `%LOCALAPPDATA%\FormSight Local` and expired questionnaire data is purged after 30 days. Every input workbook contains `Questionnaires`, `Long_Answers`, `Page_Extracts`, `Conflicts`, `Failed_Jobs`, `QA_Summary`, `Data_Analysis`, `Run_Log`, `Reasonableness`, and `Review_Audit`. A corrupted or failed input still receives its own failure workbook, successful inputs are not lost, and unresolved findings are labelled `COMPLETED — FLAGS PRESENT`.
+Local working records and restart state are stored under `%LOCALAPPDATA%\FormSight Local` and expired questionnaire data is purged after 30 days. Every series workbook contains `Questionnaires`, `Long_Answers`, `Page_Extracts`, `Conflicts`, `Failed_Jobs`, `QA_Summary`, `Data_Analysis`, `Run_Log`, `Reasonableness`, and `Review_Audit`. Page results and partial series workbooks are atomically checkpointed after every source; a restarted app offers to resume unfinished batches and skips completed pages. Dense reasonableness checks are context-bounded, LM Studio output limits reduce automatically after context errors, and failed pages retry once at a smaller image size before being flagged without stopping later inputs.
 
 To build the installer on a developer PC, install 64-bit Python 3.11 or 3.12 and Inno Setup 6, then double-click `Build-FormSight-Local.bat` or run:
 
@@ -24,7 +24,7 @@ To build the installer on a developer PC, install 64-bit Python 3.11 or 3.12 and
 powershell -ExecutionPolicy Bypass -File scripts\build-desktop.ps1
 ```
 
-The repeatable build creates a PyInstaller one-folder application, wraps it as `release\FormSight-Local-Setup.exe`, and creates a transfer-ready `release\FormSight-Local-v0.3.0-Transfer.zip`. The ZIP contains only the installer, a bilingual quick-start guide, and its SHA-256 checksum. If the installer already exists, `Package-FormSight-Transfer.bat` can rebuild the ZIP without recompiling the app. LM Studio remains responsible for GPU inference, so the desktop installer does not bundle model weights, CUDA libraries, or ONNX Runtime.
+The repeatable build creates a PyInstaller one-folder application, wraps it as `release\FormSight-Local-Setup.exe`, and creates a transfer-ready `release\FormSight-Local-v0.4.0-Transfer.zip`. The ZIP contains only the installer, a bilingual quick-start guide, and its SHA-256 checksum. If the installer already exists, `Package-FormSight-Transfer.bat` can rebuild the ZIP without recompiling the app. LM Studio remains responsible for GPU inference, so the desktop installer does not bundle model weights, CUDA libraries, or ONNX Runtime.
 
 Questionnaire text and images are untrusted data. The model gateway explicitly refuses document-borne instructions, disables tool use, and accepts only schema-validated JSON. LM Studio stays on `127.0.0.1`; browsers only connect to the HTTPS web application.
 

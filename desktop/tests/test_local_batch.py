@@ -161,7 +161,8 @@ def test_mixed_batch_writes_one_corresponding_workbook_per_input(tmp_path, monke
     failed_workbook = load_workbook(output / "broken_FormSight.xlsx", data_only=True)
     failed_rows = list(failed_workbook["Failed_Jobs"].iter_rows(min_row=2, values_only=True))
     assert len(failed_rows) == 1
-    assert failed_rows[0][0] == broken.name
+    assert failed_rows[0][0] == broken.stem
+    assert failed_rows[0][1] == broken.name
 
     with runtime.sessions() as db:
         batch = db.get(LocalBatch, batch_id)
@@ -199,5 +200,53 @@ def test_same_stem_inputs_receive_distinct_stable_output_names(tmp_path, monkeyp
         )
         assert [Path(item.output_path).name for item in items] == [
             "survey_FormSight.xlsx",
-            "survey_FormSight_2.xlsx",
+            "survey_2_FormSight.xlsx",
         ]
+
+
+def test_same_series_label_consolidates_multiple_sources_into_one_workbook(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-data"))
+    runtime = create_runtime("http://127.0.0.1:1234")
+    monkeypatch.setattr("desktop.runner.QuestionnaireExtractor", FakeExtractor)
+    first = tmp_path / "part-1.png"
+    second = tmp_path / "part-2.jpg"
+    broken = tmp_path / "part-3.pdf"
+    Image.new("RGB", (80, 100), "white").save(first)
+    Image.new("RGB", (80, 100), "white").save(second)
+    broken.write_bytes(b"not a PDF")
+    output = tmp_path / "outputs"
+
+    runner = LocalBatchRunner(runtime)
+    batch_id = runner.create_batch(
+        [first, second, broken],
+        output,
+        ready_discovery(),
+        review_groups=False,
+        series_labels=["Study A", "study a", "Study A"],
+    )
+    result = runner.execute_batch(batch_id)
+
+    assert result is not None
+    assert result["workbooks"] == 1
+    assert result["source_files"] == 3
+    workbook_path = output / "Study A_FormSight.xlsx"
+    assert list(output.glob("*.xlsx")) == [workbook_path]
+    workbook = load_workbook(workbook_path, data_only=True)
+    qa = {row[0]: row[1] for row in workbook["QA_Summary"].iter_rows(min_row=2, values_only=True)}
+    assert qa["Series_Label"] == "Study A"
+    assert qa["Source_Files"] == 3
+    assert qa["Questionnaires"] == 2
+    assert qa["Failed_Inputs"] == 1
+    headers = [cell.value for cell in workbook["Long_Answers"][1]]
+    assert "Series_Label" in headers
+    assert "Series_Questionnaire_Index" in headers
+    source_column = headers.index("Source_File")
+    sources = {
+        row[source_column]
+        for row in workbook["Long_Answers"].iter_rows(min_row=2, values_only=True)
+    }
+    assert sources == {first.name, second.name}
+    failed = list(workbook["Failed_Jobs"].iter_rows(min_row=2, values_only=True))
+    assert len(failed) == 1
+    assert failed[0][0] == "Study A"
+    assert failed[0][1] == broken.name

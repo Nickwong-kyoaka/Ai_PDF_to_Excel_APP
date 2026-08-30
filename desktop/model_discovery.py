@@ -1,12 +1,102 @@
 from __future__ import annotations
 
 import json
+import ipaddress
+import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
+
+
+RECENT_SERVER_LIMIT = 5
+
+
+def _history_path() -> Path:
+    base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    return base / "FormSight Local" / "lmstudio-servers.json"
+
+
+def _allowed_private_host(host: str) -> bool:
+    lowered = host.casefold().rstrip(".")
+    if lowered == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(lowered)
+    except ValueError:
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", lowered):
+            return lowered.endswith((".local", ".lan", ".internal", ".home.arpa"))
+        return True  # A single-label Windows/LAN computer name.
+    shared_v4 = ipaddress.ip_network("100.64.0.0/10")
+    return bool(
+        address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or (isinstance(address, ipaddress.IPv4Address) and address in shared_v4)
+    )
+
+
+def normalize_server_address(value: str) -> str:
+    """Normalize a local/private-LAN LM Studio endpoint and reject public targets."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("Enter an LM Studio computer name or private IP address")
+    if "://" not in raw:
+        raw = "http://" + raw
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("LM Studio server must use http:// or https://")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Credentials, query strings, and fragments are not allowed in the server address")
+    host = parsed.hostname or ""
+    if not host or not _allowed_private_host(host):
+        raise ValueError("Use only localhost, a private LAN/VPN IP, or a local computer name")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 1234)
+    except ValueError as exc:
+        raise ValueError("LM Studio server port must be between 1 and 65535") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("LM Studio server port must be between 1 and 65535")
+    path = parsed.path.rstrip("/")
+    if path not in {"", "/v1", "/api/v1"}:
+        raise ValueError("Enter only the LM Studio server address, without an API path")
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"{parsed.scheme}://{rendered_host}:{port}"
+
+
+def load_recent_servers() -> list[str]:
+    try:
+        payload = json.loads(_history_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    recent: list[str] = []
+    for value in payload:
+        try:
+            normalized = normalize_server_address(str(value))
+        except ValueError:
+            continue
+        if normalized not in recent:
+            recent.append(normalized)
+    return recent[:RECENT_SERVER_LIMIT]
+
+
+def remember_server(value: str) -> None:
+    normalized = normalize_server_address(value)
+    recent = [normalized, *[item for item in load_recent_servers() if item != normalized]]
+    path = _history_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(recent[:RECENT_SERVER_LIMIT], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -194,45 +284,54 @@ def loopback_binding_only(port: int) -> bool | None:
     return True if found else None
 
 
-def discover_models(timeout: float = 5.0) -> DiscoveryResult:
-    port = discover_lmstudio_port()
-    base_url = f"http://127.0.0.1:{port}"
+def discover_models(timeout: float = 5.0, base_url: str | None = None) -> DiscoveryResult:
+    manual_target = bool(base_url and base_url.strip())
+    if manual_target:
+        try:
+            target = normalize_server_address(str(base_url))
+        except ValueError as exc:
+            return DiscoveryResult("invalid_server", str(base_url), 0, message=str(exc))
+        parsed = urlsplit(target)
+        port = int(parsed.port or (443 if parsed.scheme == "https" else 1234))
+    else:
+        port = discover_lmstudio_port()
+        target = f"http://127.0.0.1:{port}"
     try:
-        response = httpx.get(f"{base_url}/api/v1/models", timeout=timeout)
+        response = httpx.get(f"{target}/api/v1/models", timeout=timeout)
         if response.status_code in {401, 403}:
             return DiscoveryResult(
-                "authentication_required", base_url, port,
-                message="LM Studio authentication is enabled. Disable it for this loopback-only desktop app.",
+                "authentication_required", target, port,
+                message="LM Studio authentication is enabled. This desktop build does not send an API token.",
             )
         response.raise_for_status()
         vision, judges = select_loaded_models(response.json())
     except Exception as exc:
         return DiscoveryResult(
-            "offline", base_url, port,
-            message=f"Start the LM Studio local server, then load a Qwen VL model. ({str(exc)[:140]})",
+            "offline", target, port,
+            message=f"Could not reach {target}. Start its LM Studio server and check the address/firewall. ({str(exc)[:120]})",
         )
-    binding = loopback_binding_only(port)
-    if binding is False:
-        return DiscoveryResult(
-            "network_exposed",
-            base_url,
-            port,
-            message=(
-                "LM Studio is listening beyond this PC. In LM Studio Server Settings, disable "
-                "'Serve on Local Network', restart the server, then refresh. / LM Studio 正在對外監聽；"
-                "請停用「Serve on Local Network」、重新啟動伺服器，再按重新偵測。"
-            ),
-        )
-    if binding is None:
-        return DiscoveryResult(
-            "binding_unknown",
-            base_url,
-            port,
-            message=(
-                "Could not verify that LM Studio is loopback-only. Restart LM Studio with "
-                "'Serve on Local Network' disabled. / 無法確認 LM Studio 僅限本機；請停用網路分享後重新啟動。"
-            ),
-        )
+    if not manual_target:
+        binding = loopback_binding_only(port)
+        if binding is False:
+            return DiscoveryResult(
+                "network_exposed",
+                target,
+                port,
+                message=(
+                    "Auto-detected LM Studio is listening beyond this PC. Select its explicit private-LAN "
+                    "address if this is intentional, or disable 'Serve on Local Network'."
+                ),
+            )
+        if binding is None:
+            return DiscoveryResult(
+                "binding_unknown",
+                target,
+                port,
+                message=(
+                    "Could not verify the auto-detected server binding. Enter its explicit localhost/private-LAN "
+                    "address, or restart LM Studio with network sharing disabled."
+                ),
+            )
     qwen_vision = [
         model
         for model in vision
@@ -240,7 +339,7 @@ def discover_models(timeout: float = 5.0) -> DiscoveryResult:
     ]
     if not qwen_vision:
         return DiscoveryResult(
-            "no_vision_model", base_url, port, judge_models=judges,
+            "no_vision_model", target, port, judge_models=judges,
             vision_models=vision,
             message="LM Studio is online, but no loaded Qwen vision model was detected.",
         )
@@ -249,7 +348,7 @@ def discover_models(timeout: float = 5.0) -> DiscoveryResult:
     if not selected_verifier:
         return DiscoveryResult(
             "verifier_required",
-            base_url,
+            target,
             port,
             vision_models=vision,
             judge_models=judges,
@@ -257,12 +356,12 @@ def discover_models(timeout: float = 5.0) -> DiscoveryResult:
             selected_judge=selected_vision,
             message=(
                 "Load a second, non-Qwen vision model in LM Studio. Recommended: "
-                "google/gemma-3-4b Q4 with 16384 context and Flash Attention."
+                "google/gemma-3-4b Q4 with 8192–12288 context and Flash Attention."
             ),
         )
     return DiscoveryResult(
         "ready",
-        base_url,
+        target,
         port,
         vision_models=vision,
         judge_models=judges,

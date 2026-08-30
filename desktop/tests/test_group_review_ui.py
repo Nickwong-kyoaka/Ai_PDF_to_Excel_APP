@@ -74,6 +74,10 @@ def test_automatic_balanced_mode_is_the_default() -> None:
     assert window.run_mode_combo.currentData() == "automatic"
     assert window.performance_combo.currentData() == "balanced"
     assert "no pauses" in window.run_mode_combo.currentText()
+    assert window._selected_server_target() is None
+
+    window.server_combo.setEditText("192.168.1.80:1234")
+    assert window._selected_server_target() == "192.168.1.80:1234"
 
     window.close()
     app.processEvents()

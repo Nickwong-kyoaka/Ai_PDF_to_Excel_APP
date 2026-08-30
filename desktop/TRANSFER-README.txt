@@ -23,14 +23,18 @@ DESTINATION PC / 目標電腦
    Keep both models loaded. FormSight sends requests sequentially, never in parallel.
    保持兩個模型已載入；FormSight 只會順序呼叫，不會平行執行。
 
-4. Start the LM Studio local server on loopback (127.0.0.1), with authentication off.
-   啟動 LM Studio 本機伺服器，使用 127.0.0.1 並關閉驗證。
+4. Start LM Studio with authentication off. If it is on this PC, use loopback (127.0.0.1).
+   If it is on another trusted GPU PC, enable LAN serving and restrict its firewall to this PC/VPN.
+   啟動 LM Studio 並關閉驗證。同一電腦請使用 127.0.0.1；若使用另一部可信 GPU 電腦，
+   請啟用 LAN 服務，並在防火牆只允許本電腦或 VPN 存取。
 
 5. Verify FormSight-Local-Setup.exe against SHA256SUMS.txt, then run it.
    依 SHA256SUMS.txt 核對安裝程式，再執行 FormSight-Local-Setup.exe。
 
-6. Launch FormSight Local. Wait for both green readiness cards, then drag in files or folders.
-   啟動 FormSight 本機版；等待兩個狀態卡顯示綠色，再拖入檔案或資料夾。
+6. Launch FormSight Local. Keep Auto-detect, or enter the exact private server address, for example
+   192.168.1.50:1234 or gpu-pc:1234, then click Refresh. Wait for the expected models to appear in green.
+   啟動 FormSight 本機版。可保留自動偵測，或輸入指定私人伺服器位址（例如
+   192.168.1.50:1234 或 gpu-pc:1234），再按重新偵測並確認綠色狀態顯示正確模型。
 
 7. Select related file rows and click Set Series Label. Every PDF with the same label is combined
    into one Excel workbook, even when one PDF contains one questionnaire and another contains many.
@@ -71,8 +75,8 @@ LONG-RUN SAFETY / 長時間執行保護
 - Completed pages and partial series Excel files are checkpointed. Reopening the app offers recovery.
   已完成頁面及系列 Excel 會持續保存；重新開啟程式時可恢復未完成批次。
 
-No Python, Node.js, API URL, API token, web server, or YOLO installation is required.
-不需安裝 Python、Node.js、API 網址、API token、網頁伺服器或 YOLO。
+No Python, Node.js, API token, web server, or YOLO installation is required. A server address is optional.
+不需安裝 Python、Node.js、API token、網頁伺服器或 YOLO；伺服器位址只在需要時輸入。
 
 Local working data is stored under %LOCALAPPDATA%\FormSight Local and is purged after 30 days.
 本機工作資料儲存於 %LOCALAPPDATA%\FormSight Local，並於 30 天後清除。

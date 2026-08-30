@@ -38,7 +38,12 @@ from PySide6.QtWidgets import (
 from backend.app.documents import ProposedGroup, validate_group_partition
 from . import __version__
 from .group_series import build_fixed_size_series, clone_page_pattern, numbered_participant_ids
-from .model_discovery import DiscoveryResult, discover_models
+from .model_discovery import (
+    DiscoveryResult,
+    discover_models,
+    load_recent_servers,
+    remember_server,
+)
 from .runner import (
     ALLOWED_SUFFIXES,
     GroupDraft,
@@ -60,6 +65,8 @@ TEXT = {
         "step_scan": "4  SCAN",
         "language": "介面語言",
         "lm": "LM Studio",
+        "server": "LM Studio server",
+        "server_auto": "Auto-detect on this PC",
         "yolo": "Sequential consensus",
         "refresh": "Refresh detection",
         "add_files": "Add Files",
@@ -116,6 +123,8 @@ TEXT = {
         "step_scan": "4  掃描",
         "language": "Interface language",
         "lm": "LM Studio",
+        "server": "LM Studio 伺服器",
+        "server_auto": "自動偵測此電腦",
         "yolo": "順序式雙模型共識",
         "refresh": "重新偵測",
         "add_files": "加入檔案",
@@ -169,8 +178,12 @@ TEXT = {
 class DiscoveryThread(QThread):
     result_ready = Signal(object)
 
+    def __init__(self, base_url: str | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.base_url = base_url
+
     def run(self) -> None:
-        self.result_ready.emit(discover_models())
+        self.result_ready.emit(discover_models(base_url=self.base_url))
 
 
 class BatchThread(QThread):
@@ -561,6 +574,7 @@ class MainWindow(QMainWindow):
         self.series_labels: list[str] = []
         self._refreshing_files = False
         self._resume_prompted = False
+        self._active_discovery_target: str | None = None
         self.setMinimumSize(1180, 800)
         self.setAcceptDrops(True)
         self._build_ui()
@@ -616,10 +630,18 @@ class MainWindow(QMainWindow):
         model_frame = QFrame()
         model_frame.setObjectName("panel")
         model_form = QFormLayout(model_frame)
+        self.server_label = QLabel()
+        self.server_combo = QComboBox()
+        self.server_combo.setEditable(True)
+        self.server_combo.setMinimumContentsLength(28)
+        self.server_combo.addItem("", "")
+        for server in load_recent_servers():
+            self.server_combo.addItem(server, server)
         self.vision_label = QLabel()
         self.judge_label = QLabel()
         self.vision_combo = QComboBox()
         self.judge_combo = QComboBox()
+        model_form.addRow(self.server_label, self.server_combo)
         model_form.addRow(self.vision_label, self.vision_combo)
         model_form.addRow(self.judge_label, self.judge_combo)
         outer.addWidget(model_frame)
@@ -802,6 +824,12 @@ class MainWindow(QMainWindow):
         ):
             label.setText(self.tr(key))
         self.lm_title.setText(self.tr("lm"))
+        self.server_label.setText(self.tr("server"))
+        if self.server_combo.count():
+            self.server_combo.setItemText(0, self.tr("server_auto"))
+        self.server_combo.setToolTip(
+            "Auto, 127.0.0.1:1234, or a private LAN/VPN address such as 192.168.1.50:1234"
+        )
         self.yolo_title.setText(self.tr("yolo"))
         self.refresh_button.setText(self.tr("refresh"))
         self.vision_label.setText(self.tr("vision"))
@@ -857,21 +885,22 @@ class MainWindow(QMainWindow):
         self.refresh_button.setEnabled(False)
         self.start_button.setEnabled(False)
         self.lm_status.setText("Checking LM Studio… / 正在偵測 LM Studio…")
-        self.discovery_thread = DiscoveryThread(self)
+        self._active_discovery_target = self._selected_server_target()
+        self.discovery_thread = DiscoveryThread(self._active_discovery_target, self)
         self.discovery_thread.result_ready.connect(self._show_discovery)
         self.discovery_thread.finished.connect(lambda: self.refresh_button.setEnabled(True))
         self.discovery_thread.start()
 
     def _show_discovery(self, result: DiscoveryResult) -> None:
         self.discovery = result
-        self.runtime = create_runtime(result.base_url)
+        self.runtime = create_runtime(result.base_url) if result.base_url.startswith(("http://", "https://")) else None
         ready = result.status == "ready"
         color = "#117d65" if ready else "#b14a3c"
         self.lm_status.setStyleSheet(f"color: {color}; font-weight: 600;")
         if ready and result.selected_vision and result.selected_verifier:
             self.lm_status.setText(
                 f"● {self.tr('ready')} — {result.selected_vision.display_name}\n"
-                f"+ {result.selected_verifier.display_name} · 127.0.0.1:{result.port}"
+                f"+ {result.selected_verifier.display_name} · {result.base_url}"
             )
         else:
             self.lm_status.setText(f"● {self.tr('not_ready')} — {result.message}")
@@ -912,6 +941,14 @@ class MainWindow(QMainWindow):
             )
         )
         self.start_button.setEnabled(ready and bool(self.paths) and not self._busy())
+        if ready and self._active_discovery_target:
+            try:
+                remember_server(result.base_url)
+                if self.server_combo.findData(result.base_url) < 0:
+                    self.server_combo.addItem(result.base_url, result.base_url)
+                self.server_combo.setCurrentText(result.base_url)
+            except (OSError, ValueError) as exc:
+                self._log(f"Could not save LM Studio server history: {exc}")
         if self.runtime:
             try:
                 removed = LocalBatchRunner(self.runtime).purge_expired()
@@ -924,6 +961,15 @@ class MainWindow(QMainWindow):
                 resumable = LocalBatchRunner(self.runtime).latest_resumable_batch()
                 if resumable:
                     QTimer.singleShot(0, self._offer_crash_resume)
+
+    def _selected_server_target(self) -> str | None:
+        text = self.server_combo.currentText().strip()
+        if self.server_combo.currentIndex() == 0 and text == self.server_combo.itemText(0):
+            return None
+        data = self.server_combo.currentData()
+        if data and text == self.server_combo.itemText(self.server_combo.currentIndex()):
+            return str(data)
+        return text or None
 
     def _offer_crash_resume(self) -> None:
         if self._busy():
@@ -1283,6 +1329,7 @@ class MainWindow(QMainWindow):
             self.set_label_button,
             self.file_table,
             self.output_browse_button,
+            self.server_combo,
             self.run_mode_combo,
             self.performance_combo,
             self.vision_combo,

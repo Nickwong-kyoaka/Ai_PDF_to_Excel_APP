@@ -12,6 +12,9 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from PIL import Image, ImageDraw
+
+from backend.app.scanner.lmstudio import LMStudioGateway
 
 
 RECENT_SERVER_LIMIT = 5
@@ -121,7 +124,38 @@ class DiscoveryResult:
     selected_vision: DetectedModel | None = None
     selected_verifier: DetectedModel | None = None
     selected_judge: DetectedModel | None = None
+    probe_results: dict[str, str] = field(default_factory=dict)
     message: str = ""
+
+
+def probe_model_capability(base_url: str, model_id: str, timeout: float = 30.0) -> tuple[bool, str]:
+    """Verify that a loaded model can actually see an image and obey a tiny JSON schema."""
+
+    image = Image.new("RGB", (128, 128), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 63, 63), fill="red")
+    draw.rectangle((64, 0, 127, 63), fill="green")
+    draw.rectangle((0, 64, 63, 127), fill="yellow")
+    draw.rectangle((64, 64, 127, 127), fill="blue")
+    gateway = LMStudioGateway(base_url, "", timeout=timeout)
+    try:
+        result = gateway.chat_json(
+            model=model_id,
+            prompt=(
+                'Inspect the four-color test image. Return exactly one JSON object matching '
+                '{"vision":true,"bottom_right":"blue"}. Use lowercase English for the color.'
+            ),
+            images=[image],
+            max_tokens=96,
+            retries=0,
+        )
+    except Exception as exc:
+        return False, str(exc)[:300]
+    vision = result.get("vision") is True
+    color = str(result.get("bottom_right") or "").strip().casefold()
+    if not vision or color not in {"blue", "#0000ff"}:
+        return False, f"vision/schema test returned {result!r}"[:300]
+    return True, "vision + strict JSON passed"
 
 
 def discover_lmstudio_port() -> int:
@@ -346,19 +380,53 @@ def discover_models(timeout: float = 5.0, base_url: str | None = None) -> Discov
     selected_vision = qwen_vision[0]
     selected_verifier = select_verifier_model(vision, selected_vision)
     if not selected_verifier:
+        passed, detail = probe_model_capability(target, selected_vision.api_id)
+        if not passed:
+            return DiscoveryResult(
+                "model_probe_failed",
+                target,
+                port,
+                vision_models=vision,
+                judge_models=judges,
+                selected_vision=selected_vision,
+                selected_judge=selected_vision,
+                probe_results={"primary": detail},
+                message=f"The primary model failed the preflight image/JSON test: {detail}.",
+            )
         return DiscoveryResult(
-            "verifier_required",
+            "qwen_only",
             target,
             port,
             vision_models=vision,
             judge_models=judges,
             selected_vision=selected_vision,
             selected_judge=selected_vision,
+            probe_results={"primary": detail},
             message=(
-                "Load a second, non-Qwen vision model in LM Studio. Recommended: "
-                "google/gemma-3-4b Q4 with 8192–12288 context and Flash Attention."
+                "Qwen-only mode passed preflight. For selective independent verification, load "
+                "a non-Qwen vision model such as google/gemma-3-4b Q4."
             ),
         )
+    probe_results: dict[str, str] = {}
+    for role, model in (("primary", selected_vision), ("verifier", selected_verifier)):
+        passed, detail = probe_model_capability(target, model.api_id)
+        probe_results[role] = detail
+        if not passed:
+            return DiscoveryResult(
+                "model_probe_failed",
+                target,
+                port,
+                vision_models=vision,
+                judge_models=judges,
+                selected_vision=selected_vision,
+                selected_verifier=selected_verifier,
+                selected_judge=selected_vision,
+                probe_results=probe_results,
+                message=(
+                    f"The {role} model failed the preflight image/JSON test: {detail}. "
+                    "Reload a vision-capable model before scanning."
+                ),
+            )
     return DiscoveryResult(
         "ready",
         target,
@@ -368,5 +436,6 @@ def discover_models(timeout: float = 5.0, base_url: str | None = None) -> Discov
         selected_vision=selected_vision,
         selected_verifier=selected_verifier,
         selected_judge=selected_vision,
-        message="Sequential dual-model consensus is ready.",
+        probe_results=probe_results,
+        message="Sequential dual-model consensus passed the image/JSON preflight.",
     )

@@ -9,8 +9,8 @@ DESTINATION PC / 目標電腦
 1. Install LM Studio 0.4 or newer.
    安裝 LM Studio 0.4 或更新版本。
 
-2. Download and load both Q4 vision models in LM Studio:
-   在 LM Studio 下載並載入以下兩個 Q4 視覺模型：
+2. Download and load these Q4 vision models in LM Studio (the verifier is recommended but optional):
+   在 LM Studio 下載並載入以下 Q4 視覺模型（建議使用驗證模型，但不強制）：
    - qwen/qwen3-vl-8b (primary extraction and final judge / 主要擷取及最終判斷)
    - google/gemma-3-4b (independent verifier / 獨立驗證)
 
@@ -20,8 +20,9 @@ DESTINATION PC / 目標電腦
    - Flash Attention: enabled
    - GPU offload: all model layers
    - KV cache: GPU/Auto if both models fit; system RAM only if necessary
-   Keep both models loaded. FormSight sends requests sequentially, never in parallel.
-   保持兩個模型已載入；FormSight 只會順序呼叫，不會平行執行。
+   Keep the selected models loaded. FormSight smoke-tests image support and strict JSON first,
+   then sends requests sequentially, never in parallel.
+   保持所選模型已載入；FormSight 會先測試視覺及 JSON 能力，然後只會順序呼叫。
 
 4. Start LM Studio with authentication off. If it is on this PC, use loopback (127.0.0.1).
    If it is on another trusted GPU PC, enable LAN serving and restrict its firewall to this PC/VPN.
@@ -48,14 +49,19 @@ DESTINATION PC / 目標電腦
 
 SPEED PROFILES / 速度模式
 
-- Balanced (recommended): Qwen scans every page; Gemma checks uncertain/corrected/matrix pages and
-  a 10% audit sample. Conflicts on one page are judged together.
-  平衡模式（建議）：Qwen 掃描每頁；Gemma 只檢查可疑、更正、矩陣頁及 10% 抽查頁；同頁衝突一次判斷。
-- Maximum accuracy: both models inspect every page. This is slower and should be used only when required.
-  最高準確度：每頁均由兩個模型檢查，速度較慢，只在需要時使用。
+- Balanced (recommended): Qwen scans every page; Gemma checks uncertain or overwritten answers,
+  the first two calibration questionnaires, and a 10% audit sample.
+  平衡模式（建議）：Qwen 掃描每頁；Gemma 只檢查可疑頁、頭兩份校準問卷及 10% 抽查。
+- Higher accuracy: larger images and a 20% verifier audit. It is slower.
+  較高準確度：使用較大圖像及 20% 驗證抽查，速度較慢。
+- Qwen-only is an explicit model dropdown choice when no compatible verifier is loaded.
+  如沒有兼容驗證模型，可在模型下拉選單明確選擇「僅 Qwen」。
 
 PAGE-SERIES REVIEW / 問卷系列分組
 
+- Automatic mode reads ranges such as 001-010, verifies the repeated page cycle, and safely skips
+  uncertain files without stopping the rest of the series.
+  自動模式會讀取 001-010 等範圍、驗證重複頁面週期，並安全跳過不確定檔案而不中斷其他處理。
 - Work through one PDF at a time with Previous/Next.
   使用「上一個／下一個」逐一檢查 PDF。
 - Choose one questionnaire, one questionnaire per page, or a fixed pages-per-questionnaire series.
@@ -64,16 +70,20 @@ PAGE-SERIES REVIEW / 問卷系列分組
   可將分組模式複製到頁數相同的其他 PDF。
 - Auto-fill participant IDs and confirm the green complete-coverage message.
   可自動填寫參加者編號；確認頁面完整覆蓋提示為綠色。
+- Review page thumbnails, filename-inferred expected count, detected cycle, and confidence.
+  檢查頁面縮圖、從檔名推斷的預期數量、頁面週期及信心。
 
 LONG-RUN SAFETY / 長時間執行保護
 
-- Models are called sequentially. Balanced requests stop after 120 seconds instead of waiting repeatedly;
-  context-limit responses immediately retry with a smaller output budget.
-  模型只會順序呼叫；平衡模式每次請求最多 120 秒，不會長時間重複等待；超出 context 時會立即降低輸出 token 再試。
-- Failed pages retry with a smaller image and then become visible flags without stopping the batch.
-  失敗頁面會用較小圖片再試；仍失敗則標記，但不會停止整個批次。
-- Completed pages and partial series Excel files are checkpointed. Reopening the app offers recovery.
-  已完成頁面及系列 Excel 會持續保存；重新開啟程式時可恢復未完成批次。
+- Normal requests stop after 90 seconds. Permanent 400/404/422 errors are not retried;
+  malformed JSON is repaired from saved text without resending the page.
+  一般請求最多 90 秒；永久性 400/404/422 錯誤不會重試；格式壞掉的 JSON 會從已儲存文字修復。
+- Missing answer records receive at most one targeted crop repair; the whole page is not repeatedly resent.
+  遺漏答案最多只會進行一次答案區域修復，不會重複傳送整頁。
+- SQLite checkpoints every page and the partial Excel workbook is atomically refreshed after every questionnaire.
+  SQLite 每頁儲存，部分 Excel 在每份問卷完成後原子更新。
+- Reasonableness is flag-only: suggestions never replace the immutable scanner value.
+  合理性檢查只會標記；建議永遠不會取代不可變更的掃描值。
 
 No Python, Node.js, API token, web server, or YOLO installation is required. A server address is optional.
 不需安裝 Python、Node.js、API token、網頁伺服器或 YOLO；伺服器位址只在需要時輸入。

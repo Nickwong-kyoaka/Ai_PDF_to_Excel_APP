@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QThread, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -84,7 +85,7 @@ TEXT = {
         "review_first": "Review page groups before scanning",
         "performance": "Processing profile",
         "balanced": "Balanced — selective verifier (recommended)",
-        "maximum": "Maximum accuracy — verify every page",
+        "maximum": "Higher accuracy — larger images + 20% audit",
         "vision": "Primary vision model + judge",
         "judge": "Independent non-Qwen verifier",
         "start": "Start Scan",
@@ -93,7 +94,7 @@ TEXT = {
         "open": "Open Output Folder",
         "ready": "Ready",
         "not_ready": "Not ready",
-        "qwen_only": "Load both the primary and verifier models in LM Studio",
+        "qwen_only": "No compatible vision model passed preflight",
         "yolo_ready": "Dual-model pipeline ready",
         "source": "Source file",
         "type": "Type",
@@ -142,7 +143,7 @@ TEXT = {
         "review_first": "掃描前檢查頁面分組",
         "performance": "處理模式",
         "balanced": "平衡模式 — 只驗證可疑頁面（建議）",
-        "maximum": "最高準確度 — 每頁雙模型驗證",
+        "maximum": "較高準確度 — 較大圖像及 20% 抽查",
         "vision": "主要視覺模型兼合理性判斷",
         "judge": "獨立非 Qwen 驗證模型",
         "start": "開始掃描",
@@ -151,7 +152,7 @@ TEXT = {
         "open": "開啟輸出資料夾",
         "ready": "準備完成",
         "not_ready": "尚未準備",
-        "qwen_only": "請在 LM Studio 同時載入主要及驗證模型",
+        "qwen_only": "沒有兼容的視覺模型通過啟動測試",
         "yolo_ready": "雙模型流程準備完成",
         "source": "來源檔案",
         "type": "類型",
@@ -222,12 +223,20 @@ class GroupReviewDialog(QDialog):
         self._job_order: list[str] = []
         self._source_names: dict[str, str] = {}
         self._page_counts: dict[str, int] = {}
+        self._expected_counts: dict[str, int | None] = {}
+        self._detected_cycles: dict[str, int | None] = {}
+        self._template_variants: dict[str, str | None] = {}
+        self._pages_roots: dict[str, Path | None] = {}
         self._groups: dict[str, list[ProposedGroup]] = defaultdict(list)
         for draft in drafts:
             if draft.job_id not in self._source_names:
                 self._job_order.append(draft.job_id)
                 self._source_names[draft.job_id] = draft.source_file
                 self._page_counts[draft.job_id] = draft.page_count
+                self._expected_counts[draft.job_id] = draft.expected_questionnaires
+                self._detected_cycles[draft.job_id] = draft.detected_cycle_pages
+                self._template_variants[draft.job_id] = draft.template_variant
+                self._pages_roots[draft.job_id] = Path(draft.pages_root) if draft.pages_root else None
             self._groups[draft.job_id].append(
                 ProposedGroup(
                     start_page=draft.start_page,
@@ -278,7 +287,7 @@ class GroupReviewDialog(QDialog):
         self.pages_per_group.setValue(2)
         self.pages_per_group.setSuffix(" pages / 頁")
         self.apply_size_button = QPushButton("Apply / 套用")
-        self.copy_pattern_button = QPushButton("Copy to same-length files / 複製至同頁數檔案")
+        self.copy_pattern_button = QPushButton("Apply to matching files / 套用至匹配檔案")
         for widget in (
             self.one_document_button,
             self.one_page_button,
@@ -301,6 +310,17 @@ class GroupReviewDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table)
+
+        preview_panel = QFrame()
+        preview_panel.setObjectName("softPanel")
+        preview_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.addWidget(QLabel("Selected questionnaire pages / 所選問卷頁面"))
+        self.thumbnail_layout = QHBoxLayout()
+        preview_layout.addLayout(self.thumbnail_layout)
+        layout.addWidget(preview_panel)
 
         controls = QHBoxLayout()
         self.split_button = QPushButton("Split selected / 分割所選")
@@ -340,6 +360,7 @@ class GroupReviewDialog(QDialog):
         self.split_button.clicked.connect(self.split_selected)
         self.merge_button.clicked.connect(self.merge_selected)
         self.fill_ids_button.clicked.connect(self.fill_participant_ids)
+        self.table.currentCellChanged.connect(lambda *_args: self._render_thumbnails())
         if self._job_order:
             self._render_document(self._job_order[0])
 
@@ -392,6 +413,7 @@ class GroupReviewDialog(QDialog):
                 spinner.setRange(1, page_count)
                 spinner.setValue(value)
                 spinner.valueChanged.connect(self._update_summary)
+                spinner.valueChanged.connect(self._render_thumbnails)
                 self.table.setCellWidget(row, column, spinner)
             participant = QLineEdit(group.participant_id or "")
             participant.setPlaceholderText("Optional / 可留空")
@@ -404,7 +426,40 @@ class GroupReviewDialog(QDialog):
             self.table.setItem(row, 5, reason)
         if groups:
             self.table.selectRow(0)
+        detected_cycle = self._detected_cycles.get(job_id)
+        if detected_cycle:
+            self.pages_per_group.setValue(detected_cycle)
         self._update_summary()
+        self._render_thumbnails()
+
+    def _render_thumbnails(self) -> None:
+        while self.thumbnail_layout.count():
+            child = self.thumbnail_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        if not self._active_job_id or self.table.rowCount() == 0:
+            return
+        row = max(0, self.table.currentRow())
+        start = self._spin(row, 1).value()
+        end = self._spin(row, 2).value()
+        root = self._pages_roots.get(self._active_job_id)
+        for page_number in range(start, min(end, start + 7) + 1):
+            label = QLabel(f"Page {page_number}")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setMinimumSize(100, 140)
+            label.setStyleSheet("background: white; border: 1px solid #cdd6e1; border-radius: 6px;")
+            image_path = root / f"page-{page_number:04d}.jpg" if root else None
+            if image_path and image_path.exists():
+                pixmap = QPixmap(str(image_path)).scaled(
+                    105,
+                    145,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                label.setPixmap(pixmap)
+                label.setToolTip(f"Page {page_number}")
+            self.thumbnail_layout.addWidget(label)
+        self.thumbnail_layout.addStretch()
 
     def _switch_document(self, index: int) -> None:
         if index < 0:
@@ -436,8 +491,16 @@ class GroupReviewDialog(QDialog):
             QMessageBox.warning(self, "Invalid series / 分組無效", str(exc))
             return
         copied = 0
+        lengths = [group.end_page - group.start_page + 1 for group in pattern]
+        fixed_cycle = lengths[0] if lengths and len(set(lengths)) == 1 else None
         for job_id in self._job_order:
-            if job_id != self._active_job_id and self._page_counts[job_id] == page_count:
+            if job_id == self._active_job_id:
+                continue
+            target_pages = self._page_counts[job_id]
+            if fixed_cycle and target_pages % fixed_cycle == 0:
+                self._groups[job_id] = build_fixed_size_series(target_pages, fixed_cycle)
+                copied += 1
+            elif target_pages == page_count:
                 self._groups[job_id] = clone_page_pattern(pattern, page_count)
                 copied += 1
         QMessageBox.information(
@@ -516,8 +579,11 @@ class GroupReviewDialog(QDialog):
         current_file = self._job_order.index(self._active_job_id) + 1
         self.document_summary.setText(
             f"File {current_file} of {total_files} · {source} · {page_count} page(s) · "
+            f"expected {self._expected_counts.get(self._active_job_id) or '?'} · "
+            f"cycle {self._detected_cycles.get(self._active_job_id) or '?'} · "
             f"{self.table.rowCount()} questionnaire(s)  /  檔案 {current_file}/{total_files} · "
-            f"{page_count} 頁 · {self.table.rowCount()} 份問卷"
+            f"{page_count} 頁 · 預期 {self._expected_counts.get(self._active_job_id) or '?'} 份 · "
+            f"周期 {self._detected_cycles.get(self._active_job_id) or '?'} 頁 · {self.table.rowCount()} 份問卷"
         )
         try:
             ranges = [(self._spin(row, 1).value(), self._spin(row, 2).value()) for row in range(self.table.rowCount())]
@@ -894,13 +960,13 @@ class MainWindow(QMainWindow):
     def _show_discovery(self, result: DiscoveryResult) -> None:
         self.discovery = result
         self.runtime = create_runtime(result.base_url) if result.base_url.startswith(("http://", "https://")) else None
-        ready = result.status == "ready"
+        ready = result.status in {"ready", "qwen_only"}
         color = "#117d65" if ready else "#b14a3c"
         self.lm_status.setStyleSheet(f"color: {color}; font-weight: 600;")
-        if ready and result.selected_vision and result.selected_verifier:
+        if ready and result.selected_vision:
             self.lm_status.setText(
                 f"● {self.tr('ready')} — {result.selected_vision.display_name}\n"
-                f"+ {result.selected_verifier.display_name} · {result.base_url}"
+                f"+ {(result.selected_verifier.display_name if result.selected_verifier else 'Qwen-only / 僅 Qwen')} · {result.base_url}"
             )
         else:
             self.lm_status.setText(f"● {self.tr('not_ready')} — {result.message}")
@@ -918,6 +984,7 @@ class MainWindow(QMainWindow):
         ]
         for model in primary_options:
             self.vision_combo.addItem(f"{model.display_name} [{model.api_id}]", model.api_id)
+        self.judge_combo.addItem("Qwen-only (no independent verifier) / 僅 Qwen", "")
         for model in verifier_options:
             self.judge_combo.addItem(f"{model.display_name} [{model.api_id}]", model.api_id)
         if result.selected_vision:
@@ -936,8 +1003,14 @@ class MainWindow(QMainWindow):
                 f"● {self.tr('yolo_ready')}\n"
                 "Primary → verifier → cropped adjudication → reasonableness\n"
                 "Recommended: Q4 · 8k–12k context · Flash Attention · full GPU offload"
-                if ready
-                else f"● {self.tr('qwen_only')}"
+                if ready and result.selected_verifier
+                else (
+                    "● Qwen-only mode / 僅 Qwen 模式\n"
+                    "Primary → targeted repair → flag-only reasonableness\n"
+                    "Independent verifier coverage will be 0% by explicit choice."
+                    if ready
+                    else f"● {self.tr('qwen_only')}"
+                )
             )
         )
         self.start_button.setEnabled(ready and bool(self.paths) and not self._busy())
@@ -1123,7 +1196,7 @@ class MainWindow(QMainWindow):
             else self.tr("file_summary_empty")
         )
         self.start_button.setText(f"{self.tr('start')} · {count}" if count else self.tr("start"))
-        ready = bool(self.discovery and self.discovery.status == "ready")
+        ready = bool(self.discovery and self.discovery.status in {"ready", "qwen_only"})
         self.start_button.setEnabled(bool(count and ready and not self._busy()))
 
     def remove_selected(self) -> None:
@@ -1171,7 +1244,7 @@ class MainWindow(QMainWindow):
         if not output:
             QMessageBox.warning(self, self.tr("title"), self.tr("need_output"))
             return
-        if not self.discovery or self.discovery.status != "ready" or not self.runtime:
+        if not self.discovery or self.discovery.status not in {"ready", "qwen_only"} or not self.runtime:
             QMessageBox.warning(self, self.tr("title"), self.discovery.message if self.discovery else "LM Studio is not ready")
             return
         self.output_ready = None
@@ -1180,7 +1253,7 @@ class MainWindow(QMainWindow):
         review = self.run_mode_combo.currentData() == "review"
         processing_mode = str(self.performance_combo.currentData() or "balanced")
         vision_id = str(self.vision_combo.currentData())
-        verifier_id = str(self.judge_combo.currentData())
+        verifier_id = str(self.judge_combo.currentData() or "")
         discovery = self.discovery
 
         def prepare(runner: LocalBatchRunner):
@@ -1276,7 +1349,7 @@ class MainWindow(QMainWindow):
             self._log("Cancellation requested; finishing the current LM Studio request…")
 
     def resume_last_batch(self) -> None:
-        if not self.runtime or not self.discovery or self.discovery.status != "ready":
+        if not self.runtime or not self.discovery or self.discovery.status not in {"ready", "qwen_only"}:
             QMessageBox.warning(self, self.tr("title"), "LM Studio must be ready before resuming.")
             return
         batch_id = LocalBatchRunner(self.runtime).latest_resumable_batch()
@@ -1339,7 +1412,9 @@ class MainWindow(QMainWindow):
         ):
             widget.setEnabled(not busy)
         self.start_button.setEnabled(
-            not busy and bool(self.paths) and bool(self.discovery and self.discovery.status == "ready")
+            not busy
+            and bool(self.paths)
+            and bool(self.discovery and self.discovery.status in {"ready", "qwen_only"})
         )
         self.cancel_button.setEnabled(busy)
 

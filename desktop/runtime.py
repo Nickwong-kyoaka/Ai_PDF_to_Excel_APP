@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, select
@@ -52,6 +54,15 @@ def create_runtime(base_url: str) -> DesktopRuntime:
     work.mkdir(parents=True, exist_ok=True)
     models.mkdir(parents=True, exist_ok=True)
     database_path = root / "formsight-local.db"
+    version_marker = root / "schema-v0.6.marker"
+    upgrade_from_pre_v06 = database_path.exists() and not version_marker.exists()
+    if upgrade_from_pre_v06:
+        backup_dir = root / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = backup_dir / f"formsight-local-pre-v0.6-{stamp}.db"
+        with sqlite3.connect(database_path) as source_db, sqlite3.connect(backup_path) as backup_db:
+            source_db.backup(backup_db)
     engine = create_engine(
         f"sqlite:///{database_path.as_posix()}",
         connect_args={"check_same_thread": False},
@@ -93,6 +104,17 @@ def create_runtime(base_url: str) -> DesktopRuntime:
                 "UPDATE local_batch_items SET series_label = ? WHERE id = ?",
                 (legacy_label[:160], str(item_id)),
             )
+        for name, sql_type in (
+            ("expected_questionnaires", "INTEGER"),
+            ("pages_per_questionnaire", "INTEGER"),
+            ("grouping_confidence", "FLOAT NOT NULL DEFAULT 0"),
+            ("grouping_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("template_variant", "VARCHAR(80)"),
+        ):
+            if name not in columns:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE local_batch_items ADD COLUMN {name} {sql_type}"
+                )
         batch_columns = {
             str(row[1])
             for row in connection.exec_driver_sql("PRAGMA table_info(local_batches)").fetchall()
@@ -112,6 +134,25 @@ def create_runtime(base_url: str) -> DesktopRuntime:
             connection.exec_driver_sql("ALTER TABLE answers ADD COLUMN verifier_value JSON")
         if "verifier_model_id" not in answer_columns:
             connection.exec_driver_sql("ALTER TABLE answers ADD COLUMN verifier_model_id VARCHAR(255)")
+        for name, sql_type in (
+            ("answer_key", "VARCHAR(512)"),
+            ("page_ordinal", "INTEGER"),
+            ("template_question_id", "VARCHAR(240)"),
+            ("geometry_value", "JSON"),
+            ("geometry_confidence", "FLOAT NOT NULL DEFAULT 0"),
+        ):
+            if name not in answer_columns:
+                connection.exec_driver_sql(f"ALTER TABLE answers ADD COLUMN {name} {sql_type}")
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_answers_answer_key ON answers (answer_key)"
+        )
+        if upgrade_from_pre_v06:
+            connection.exec_driver_sql(
+                "UPDATE local_batches SET status = 'legacy_requires_restart', "
+                "stage_message = 'Created by v0.5; restart with v0.6 grouping' "
+                "WHERE status NOT IN ('completed', 'failed', 'cancelled', 'legacy_requires_restart')"
+            )
+    version_marker.write_text("0.6.0\n", encoding="utf-8")
     sessions = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
     packaged_weights = resource_path("models/questionnaire_marks.onnx")
     user_weights = models / "questionnaire_marks.onnx"

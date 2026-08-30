@@ -19,7 +19,15 @@ from backend.app.scanner.grouping import visual_grouping
 from backend.app.scanner.lmstudio import LMStudioGateway
 
 from .exporter import write_series_excel
-from .model_discovery import DiscoveryResult
+from .group_series import (
+    GroupingInference,
+    best_template_group_index,
+    build_fixed_size_series,
+    expected_questionnaire_count,
+    infer_safe_series_groups,
+    page_cycle_similarity,
+)
+from .model_discovery import DiscoveryResult, probe_model_capability
 from .runtime import DesktopRuntime, ensure_local_identity
 
 
@@ -28,40 +36,49 @@ ALLOWED_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 PROCESSING_PROFILES: dict[str, dict[str, object]] = {
     "balanced": {
-        "image_max_side": 2000,
-        "page_retry_max_side": 1600,
-        "page_attempts": 2,
+        "image_max_side": 1800,
+        "page_retry_max_side": 1800,
+        "page_attempts": 1,
         "verification_mode": "selective",
         "verifier_confidence_threshold": 0.86,
         "verifier_audit_interval": 10,
+        "verifier_calibration_questionnaires": 2,
         "verifier_tile_count": 0,
         "orientation_mode": "document",
         "orientation_retries": 0,
-        "request_timeout": 120,
+        "request_timeout": 90,
+        "extraction_max_tokens": 2048,
+        "extraction_retries": 0,
+        "template_mode": True,
+        "template_schema_max_tokens": 3072,
+        "compact_max_tokens": 1536,
+        "adjudication_chunk_size": 24,
+        "adjudication_retries": 0,
+        "judge_max_tokens": 1536,
+        "judge_retries": 0,
+    },
+    "maximum": {
+        "image_max_side": 2200,
+        "page_retry_max_side": 2200,
+        "page_attempts": 1,
+        "verification_mode": "selective",
+        "verifier_confidence_threshold": 0.91,
+        "verifier_audit_interval": 5,
+        "verifier_calibration_questionnaires": 2,
+        "verifier_tile_count": 0,
+        "tile_retries": 0,
+        "orientation_mode": "model",
+        "orientation_retries": 0,
+        "request_timeout": 90,
         "extraction_max_tokens": 3072,
         "extraction_retries": 0,
+        "template_mode": True,
+        "template_schema_max_tokens": 4096,
+        "compact_max_tokens": 2048,
         "adjudication_chunk_size": 24,
         "adjudication_retries": 0,
         "judge_max_tokens": 2048,
         "judge_retries": 0,
-    },
-    "maximum": {
-        "image_max_side": 2400,
-        "page_retry_max_side": 1900,
-        "page_attempts": 2,
-        "verification_mode": "maximum",
-        "verifier_tile_count": 2,
-        "tile_max_tokens": 2560,
-        "tile_retries": 0,
-        "orientation_mode": "model",
-        "orientation_retries": 0,
-        "request_timeout": 180,
-        "extraction_max_tokens": 4096,
-        "extraction_retries": 1,
-        "adjudication_chunk_size": 24,
-        "adjudication_retries": 1,
-        "judge_max_tokens": 2048,
-        "judge_retries": 1,
     },
 }
 
@@ -84,6 +101,10 @@ class GroupDraft:
     participant_id: str | None
     confidence: float
     reason: str
+    expected_questionnaires: int | None = None
+    detected_cycle_pages: int | None = None
+    template_variant: str | None = None
+    pages_root: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -170,14 +191,40 @@ class LocalBatchRunner:
                 raise ValueError(f"Unsupported file type: {source.name}")
             if not source.is_file():
                 raise ValueError(f"File not found: {source}")
-        if discovery.status != "ready" or not discovery.selected_vision or not discovery.selected_verifier:
+        if discovery.status not in {"ready", "qwen_only"} or not discovery.selected_vision:
             raise ValueError(discovery.message or "LM Studio is not ready")
         performance = processing_profile(processing_mode)
 
         vision_id = extractor_model_id or discovery.selected_vision.api_id
-        verifier_id = verifier_model_id or discovery.selected_verifier.api_id
-        if verifier_id == vision_id:
+        verifier_id = (
+            discovery.selected_verifier.api_id
+            if verifier_model_id is None and discovery.selected_verifier
+            else None
+        )
+        if verifier_model_id is not None:
+            verifier_id = verifier_model_id.strip() or None
+        if verifier_id and verifier_id == vision_id:
             raise ValueError("Primary and verifier vision models must be different")
+        selected_ids = {
+            "primary": vision_id,
+            **({"verifier": verifier_id} if verifier_id else {}),
+        }
+        discovered_ids = {
+            "primary": discovery.selected_vision.api_id,
+            "verifier": discovery.selected_verifier.api_id if discovery.selected_verifier else None,
+        }
+        for role, model_id in selected_ids.items():
+            already_passed = (
+                discovered_ids.get(role) == model_id
+                and "passed" in discovery.probe_results.get(role, "").casefold()
+            )
+            if already_passed:
+                continue
+            passed, detail = probe_model_capability(discovery.base_url, model_id)
+            if not passed:
+                raise ValueError(
+                    f"Selected {role} model failed the image/JSON preflight: {detail}"
+                )
         judge_id = judge_model_id or vision_id
         output = Path(output_path).expanduser().resolve()
         if output.exists() and not output.is_dir():
@@ -280,7 +327,19 @@ class LocalBatchRunner:
             batch.error = None
             db.commit()
 
-            for item_index, item in enumerate(items):
+            # Within each label, inspect explicit filename ranges first so their
+            # confirmed cycle can be safely applied to sibling PDFs even if the user
+            # added an unnumbered file before them.
+            preparation_order = sorted(
+                items,
+                key=lambda item: (
+                    item.series_label.casefold(),
+                    expected_questionnaire_count(Path(item.original_path).name) is None,
+                    item.order_index,
+                ),
+            )
+            series_patterns: dict[str, list[tuple[int, list[Path], str]]] = {}
+            for preparation_index, item in enumerate(preparation_order):
                 if self.cancel_event.is_set():
                     batch.status = "paused"
                     batch.stage_message = "Paused / 已暫停"
@@ -288,8 +347,8 @@ class LocalBatchRunner:
                     return
                 if item.job_id:
                     continue
-                overall = (item_index / max(1, len(items))) * 0.12
-                self._emit(batch.id, "preparing", overall, f"Inspecting {Path(item.original_path).name}", item_index)
+                overall = (preparation_index / max(1, len(items))) * 0.12
+                self._emit(batch.id, "preparing", overall, f"Inspecting {Path(item.original_path).name}", item.order_index)
                 item.status = "preparing"
                 item.started_at = utcnow()
                 db.commit()
@@ -300,19 +359,99 @@ class LocalBatchRunner:
                         self.runtime.settings.pages_dir / job_id,
                         max_pages=self.runtime.settings.max_pages,
                     )
-                    proposals = propose_groups(info.embedded_text)
-                    if info.page_count > 1 and len(proposals) == 1 and proposals[0].confidence < 0.5:
-                        try:
-                            proposals = visual_grouping(
-                                info.page_images,
-                                LMStudioGateway(
-                                    batch.lmstudio_base_url,
-                                    "",
-                                    timeout=float(performance["request_timeout"]),
-                                ),
-                                batch.extractor_model_id,
-                                retries=0 if batch.processing_mode == "balanced" else 1,
+                    inference = infer_safe_series_groups(
+                        Path(item.original_path).name, info.page_images
+                    )
+                    pattern_key = item.series_label.casefold()
+                    patterns = series_patterns.get(pattern_key, [])
+                    matched_variant: str | None = None
+                    if not inference.safe_for_one_take and patterns:
+                        for cycle_pages, reference_pages, variant_name in patterns:
+                            if info.page_count % cycle_pages != 0:
+                                continue
+                            similarity = page_cycle_similarity(
+                                [*reference_pages[:cycle_pages], *info.page_images], cycle_pages
                             )
+                            if similarity >= 0.90:
+                                detected_count = info.page_count // cycle_pages
+                                reason = (
+                                    f"Applied confirmed {cycle_pages}-page series pattern; "
+                                    f"cross-file layout similarity {similarity:.1%}"
+                                )
+                                inference = GroupingInference(
+                                    build_fixed_size_series(info.page_count, cycle_pages),
+                                    detected_count,
+                                    cycle_pages,
+                                    min(0.99, 0.75 + similarity * 0.25),
+                                    reason,
+                                    True,
+                                )
+                                matched_variant = variant_name
+                                break
+                    if inference.safe_for_one_take and inference.pages_per_questionnaire:
+                        cycle_pages = inference.pages_per_questionnaire
+                        if not matched_variant:
+                            for known_cycle, reference_pages, variant_name in patterns:
+                                if known_cycle != cycle_pages:
+                                    continue
+                                similarity = page_cycle_similarity(
+                                    [*reference_pages[:known_cycle], *info.page_images], known_cycle
+                                )
+                                if similarity >= 0.90:
+                                    matched_variant = variant_name
+                                    break
+                        if not matched_variant:
+                            same_cycle_count = sum(
+                                known_cycle == cycle_pages
+                                for known_cycle, _pages, _name in patterns
+                            )
+                            matched_variant = (
+                                f"{cycle_pages}p-cycle"
+                                if same_cycle_count == 0
+                                else f"{cycle_pages}p-cycle-v{same_cycle_count + 1}"
+                            )
+                            series_patterns.setdefault(pattern_key, []).append(
+                                (cycle_pages, list(info.page_images), matched_variant)
+                            )
+                    item.expected_questionnaires = inference.expected_questionnaires
+                    item.pages_per_questionnaire = inference.pages_per_questionnaire
+                    item.grouping_confidence = inference.confidence
+                    item.grouping_reason = inference.reason
+                    item.template_variant = matched_variant
+                    proposals = [
+                        ProposedGroup(
+                            proposal.start_page,
+                            proposal.end_page,
+                            proposal.participant_id,
+                            inference.confidence,
+                            inference.reason,
+                        )
+                        for proposal in inference.groups
+                    ]
+                    if not inference.safe_for_one_take and not batch.review_groups:
+                        item.status = "skipped_grouping"
+                        item.error = (
+                            "Automatic safe-skip: questionnaire boundaries were uncertain. "
+                            + inference.reason
+                        )[:2000]
+                        item.finished_at = utcnow()
+                        db.commit()
+                        continue
+                    if not inference.safe_for_one_take and batch.review_groups:
+                        proposals = propose_groups(info.embedded_text)
+                        try:
+                            if info.page_count > 1:
+                                proposals = visual_grouping(
+                                    info.page_images,
+                                    LMStudioGateway(
+                                        batch.lmstudio_base_url,
+                                        "",
+                                        timeout=float(performance["request_timeout"]),
+                                        cancel_check=self.cancel_event.is_set,
+                                    ),
+                                    batch.extractor_model_id,
+                                    retries=0,
+                                )
                         except Exception as exc:
                             proposals[0].reason += f"; visual grouping unavailable: {str(exc)[:120]}"
                     snapshot = {
@@ -326,6 +465,14 @@ class LocalBatchRunner:
                         "context_length": 12288 if batch.processing_mode == "balanced" else 16384,
                         "max_concurrency": 1,
                         "processing_mode": batch.processing_mode,
+                        "expected_questionnaires": inference.expected_questionnaires,
+                        "pages_per_questionnaire": inference.pages_per_questionnaire,
+                        "grouping_confidence": inference.confidence,
+                        "grouping_reason": inference.reason,
+                        "template_variant": item.template_variant,
+                        "template_reference_group_index": best_template_group_index(
+                            info.page_images, proposals
+                        ),
                         **performance,
                         "local_desktop": True,
                     }
@@ -415,6 +562,10 @@ class LocalBatchRunner:
                         participant_id=group.participant_id,
                         confidence=group.confidence,
                         reason=group.reason,
+                        expected_questionnaires=item.expected_questionnaires,
+                        detected_cycle_pages=item.pages_per_questionnaire,
+                        template_variant=item.template_variant,
+                        pages_root=str(self.runtime.settings.pages_dir / job.id),
                     )
                     for group in groups
                 )
@@ -453,6 +604,13 @@ class LocalBatchRunner:
                             confirmed=True,
                         )
                     )
+                lengths = [proposal.end_page - proposal.start_page + 1 for proposal in proposals]
+                if lengths and len(set(lengths)) == 1:
+                    item.expected_questionnaires = len(proposals)
+                    item.pages_per_questionnaire = lengths[0]
+                    item.grouping_confidence = 1.0
+                    item.grouping_reason = "Confirmed manually in FormSight Local"
+                    item.template_variant = f"{lengths[0]}p-manual-{job.id[:8]}"
                 job.groups_confirmed = True
                 job.status = "queued"
                 job.stage_message = "Ready for sequential processing"
@@ -481,6 +639,7 @@ class LocalBatchRunner:
                 "verifier_model_id": batch.verifier_model_id,
                 "judge_model_id": batch.judge_model_id,
                 "processing_mode": batch.processing_mode,
+                "local_desktop": True,
                 **processing_profile(batch.processing_mode),
             }
             batch.status = "running"
@@ -489,12 +648,52 @@ class LocalBatchRunner:
             db.commit()
 
             results_by_label: dict[str, dict[str, object]] = {}
+            # A confirmed page-cycle may be reused by every source in the same series
+            # and layout variant.  The dictionary is deliberately shared with each
+            # extractor instance so newly discovered page schemas become available to
+            # the next questionnaire without another full-page discovery call.
+            templates_by_series: dict[tuple[str, str], dict[str, list[dict[str, object]]]] = {}
+            template_questionnaire_counts: dict[tuple[str, str], int] = {}
             for item_index, item in enumerate(items):
                 if self.cancel_event.is_set():
                     self._pause(db, batch, item)
                     return None
 
+                if item.status == "skipped_grouping":
+                    try:
+                        result = self._write_series_workbook(db, batch, item.series_label)
+                        results_by_label[item.series_label.casefold()] = result
+                    except Exception as exc:
+                        self._emit(
+                            batch.id,
+                            "checkpoint_warning",
+                            batch.progress,
+                            f"Safe-skip checkpoint delayed: {str(exc)[:160]}",
+                            item_index,
+                        )
+                    continue
                 if item.status == "completed":
+                    completed_job = db.get(Job, item.job_id) if item.job_id else None
+                    completed_snapshot = dict(completed_job.profile_snapshot or {}) if completed_job else {}
+                    completed_template = completed_snapshot.get("series_template_v1") or {}
+                    completed_pages = completed_template.get("pages")
+                    template_key = (
+                        item.series_label.casefold(),
+                        (item.template_variant or "generic").casefold(),
+                    )
+                    if isinstance(completed_pages, dict):
+                        templates_by_series.setdefault(template_key, {}).update(completed_pages)
+                    if completed_job:
+                        completed_groups = len(
+                            db.scalars(
+                                select(QuestionnaireGroup).where(
+                                    QuestionnaireGroup.job_id == completed_job.id
+                                )
+                            ).all()
+                        )
+                        template_questionnaire_counts[template_key] = (
+                            template_questionnaire_counts.get(template_key, 0) + completed_groups
+                        )
                     try:
                         result = self._write_series_workbook(db, batch, item.series_label)
                         results_by_label[item.series_label.casefold()] = result
@@ -542,13 +741,54 @@ class LocalBatchRunner:
                     db.commit()
                     self._emit(batch.id, stage, overall, message, item_index)
 
+                def questionnaire_checkpoint(completed: int, total: int) -> None:
+                    try:
+                        result = self._write_series_workbook(db, batch, item.series_label)
+                        results_by_label[item.series_label.casefold()] = result
+                        self._emit(
+                            batch.id,
+                            "checkpointing",
+                            batch.progress,
+                            f"Saved questionnaire {completed}/{total} to partial Excel",
+                            item_index,
+                        )
+                    except Exception as exc:
+                        self._emit(
+                            batch.id,
+                            "checkpoint_warning",
+                            batch.progress,
+                            f"Questionnaire checkpoint delayed: {str(exc)[:160]}",
+                            item_index,
+                        )
+
+                template_key = (
+                    item.series_label.casefold(),
+                    (item.template_variant or "generic").casefold(),
+                )
+                shared_template = templates_by_series.setdefault(template_key, {})
+                saved_template = (dict(job.profile_snapshot or {}).get("series_template_v1") or {}).get(
+                    "pages"
+                )
+                if isinstance(saved_template, dict):
+                    shared_template.update(saved_template)
+                job_profile = {
+                    **profile,
+                    "template_reference_group_index": dict(job.profile_snapshot or {}).get(
+                        "template_reference_group_index", 0
+                    ),
+                    "verifier_calibration_offset": template_questionnaire_counts.get(
+                        template_key, 0
+                    ),
+                }
                 extractor = QuestionnaireExtractor(
                     self.runtime.settings,
-                    profile,
+                    job_profile,
                     self.runtime.weights_path if self.runtime.weights_path.exists() else None,
                     manage_models=False,
                     progress_callback=page_progress,
                     cancel_check=self.cancel_event.is_set,
+                    template_pages=shared_template,
+                    questionnaire_callback=questionnaire_checkpoint,
                 )
                 try:
                     extractor.extract_job(db, job)
@@ -567,6 +807,16 @@ class LocalBatchRunner:
                     job.stage_message = "Completed for its source workbook"
                     item.status = "completed"
                     item.finished_at = utcnow()
+                    template_questionnaire_counts[template_key] = (
+                        template_questionnaire_counts.get(template_key, 0)
+                        + len(
+                            db.scalars(
+                                select(QuestionnaireGroup).where(
+                                    QuestionnaireGroup.job_id == job.id
+                                )
+                            ).all()
+                        )
+                    )
                 except Exception as exc:
                     job.status = "failed"
                     job.error = str(exc)[:2000]
@@ -603,12 +853,20 @@ class LocalBatchRunner:
                 try:
                     result = self._write_series_workbook(db, batch, label)
                     results_by_label[label.casefold()] = result
+                    for series_item in items:
+                        if (
+                            series_item.series_label.casefold() == label.casefold()
+                            and series_item.status == "completed"
+                            and series_item.error
+                            and "Excel export failed:" in series_item.error
+                        ):
+                            series_item.error = None
+                    db.commit()
                 except Exception as exc:
                     final_export_errors[label.casefold()] = str(exc)[:1000]
                     for series_item in items:
                         if series_item.series_label.casefold() == label.casefold():
                             previous = series_item.error
-                            series_item.status = "export_failed"
                             series_item.error = (
                                 f"{previous}; Excel export failed: {exc}"
                                 if previous
@@ -618,7 +876,10 @@ class LocalBatchRunner:
                 final_progress = 0.98 + ((label_index + 1) / max(1, len(unique_labels))) * 0.019
                 self._emit(batch.id, "exporting", final_progress, f"Finalizing series: {label}")
 
-            failed = sum(item.status in {"failed", "export_failed"} for item in items)
+            failed = sum(
+                item.status in {"failed", "export_failed", "skipped_grouping"}
+                for item in items
+            )
             results = list(results_by_label.values())
             flags = sum(int(result.get("flags", 0)) for result in results)
             status_label = "COMPLETED — FLAGS PRESENT" if failed or flags else "COMPLETED"

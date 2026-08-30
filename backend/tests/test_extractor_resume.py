@@ -84,7 +84,15 @@ def test_extract_job_skips_pages_already_checkpointed(tmp_path, monkeypatch):
         )
         calls: list[int] = []
 
-        def fake_extract(source, page_number, total_pages, yolo_available, image_max_side=None):
+        def fake_extract(
+            source,
+            page_number,
+            total_pages,
+            yolo_available,
+            image_max_side=None,
+            page_ordinal=None,
+            force_verifier=False,
+        ):
             calls.append(page_number)
             return [], {"checkpoint_complete": True}
 

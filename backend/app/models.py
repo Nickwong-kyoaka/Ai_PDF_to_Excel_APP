@@ -122,13 +122,17 @@ class Answer(Base):
     __table_args__ = (
         Index("idx_answers_job_group", "job_id", "group_id"),
         Index("idx_answers_review", "job_id", "review_status"),
+        Index("idx_answers_answer_key", "answer_key"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    answer_key: Mapped[str | None] = mapped_column(String(512))
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
     group_id: Mapped[str] = mapped_column(ForeignKey("questionnaire_groups.id", ondelete="CASCADE"), nullable=False)
     page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_ordinal: Mapped[int | None] = mapped_column(Integer)
     question_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    template_question_id: Mapped[str | None] = mapped_column(String(240))
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
     section: Mapped[str] = mapped_column(Text, default="")
     answer_type: Mapped[str] = mapped_column(String(50), default="other")
@@ -138,6 +142,8 @@ class Answer(Base):
     yolo_value: Mapped[Any] = mapped_column(JSON, nullable=True)
     verifier_value: Mapped[Any] = mapped_column(JSON, nullable=True)
     verifier_model_id: Mapped[str | None] = mapped_column(String(255))
+    geometry_value: Mapped[Any] = mapped_column(JSON, nullable=True)
+    geometry_confidence: Mapped[float] = mapped_column(Float, default=0.0)
     scanner_value: Mapped[Any] = mapped_column(JSON, nullable=True)
     scanner_confidence: Mapped[float] = mapped_column(Float, default=0.0)
     fusion_reason: Mapped[str] = mapped_column(Text, default="")
@@ -279,6 +285,11 @@ class LocalBatchItem(Base):
     original_path: Mapped[str] = mapped_column(Text, nullable=False)
     stored_path: Mapped[str] = mapped_column(Text, nullable=False)
     series_label: Mapped[str] = mapped_column(String(160), default="", nullable=False)
+    expected_questionnaires: Mapped[int | None] = mapped_column(Integer)
+    pages_per_questionnaire: Mapped[int | None] = mapped_column(Integer)
+    grouping_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    grouping_reason: Mapped[str] = mapped_column(Text, default="")
+    template_variant: Mapped[str | None] = mapped_column(String(80))
     output_path: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), default="pending", nullable=False)
     error: Mapped[str | None] = mapped_column(Text)

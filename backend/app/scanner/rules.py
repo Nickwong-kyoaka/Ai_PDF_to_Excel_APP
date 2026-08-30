@@ -68,7 +68,14 @@ def generic_findings(answer: dict[str, Any]) -> list[dict[str, Any]]:
     allowed = answer.get("allowed_options") or []
     allowed_labels = [str(item.get("label") if isinstance(item, dict) else item) for item in allowed]
     answer_type = answer.get("answer_type")
-    if allowed_labels and answer_type in {"single_choice", "yes_no", "consent", "scale"}:
+    if allowed_labels and answer_type in {
+        "single_choice",
+        "yes_no",
+        "consent",
+        "scale",
+        "matrix",
+        "matrix_row",
+    }:
         if _text(value) and _text(value).casefold() not in {item.casefold() for item in allowed_labels}:
             findings.append(
                 {

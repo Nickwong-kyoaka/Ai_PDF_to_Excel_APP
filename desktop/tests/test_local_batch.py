@@ -41,6 +41,10 @@ def ready_discovery() -> DiscoveryResult:
         selected_vision=vision,
         selected_verifier=verifier,
         selected_judge=vision,
+        probe_results={
+            "primary": "vision + strict JSON passed",
+            "verifier": "vision + strict JSON passed",
+        },
     )
 
 
@@ -55,8 +59,8 @@ class FakeExtractor:
         assert profile["verifier_model_id"] == "gemma-verifier-loaded"
         assert profile["judge_model_id"] == "qwen-vision-loaded"
         assert profile["verification_mode"] == "selective"
-        assert profile["request_timeout"] == 120
-        assert profile["image_max_side"] == 2000
+        assert profile["request_timeout"] == 90
+        assert profile["image_max_side"] == 1800
         self.yolo = FakeYolo()
 
     def extract_job(self, db, job) -> None:
@@ -65,10 +69,13 @@ class FakeExtractor:
         )
         db.add(
             Answer(
+                answer_key=f"{job.id}:G1:P1:P1-Q1",
                 job_id=job.id,
                 group_id=group.id,
                 page_number=1,
+                page_ordinal=1,
                 question_id="Q1",
+                template_question_id="P1-Q1",
                 question_text="你今天好嗎？ / Are you well today?",
                 answer_type="single_choice",
                 allowed_options=["Yes", "No"],
@@ -133,13 +140,17 @@ def test_mixed_batch_writes_one_corresponding_workbook_per_input(tmp_path, monke
     workbook = load_workbook(output / "中文問卷_FormSight.xlsx", data_only=True)
     assert workbook.sheetnames == [
         "Questionnaires",
+        "Responses",
         "Long_Answers",
         "Page_Extracts",
         "Conflicts",
         "Failed_Jobs",
+        "Grouping",
+        "Data_Dictionary",
         "QA_Summary",
         "Data_Analysis",
         "Run_Log",
+        "Run_Settings",
         "Reasonableness",
         "Review_Audit",
     ]
@@ -209,6 +220,75 @@ def test_same_stem_inputs_receive_distinct_stable_output_names(tmp_path, monkeyp
             "survey_FormSight.xlsx",
             "survey_2_FormSight.xlsx",
         ]
+
+
+def test_disk_full_export_failure_resumes_without_reextracting(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-data"))
+    runtime = create_runtime("http://127.0.0.1:1234")
+    monkeypatch.setattr("desktop.runner.QuestionnaireExtractor", FakeExtractor)
+    source = tmp_path / "questionnaire.png"
+    Image.new("RGB", (80, 100), "white").save(source)
+    output = tmp_path / "outputs"
+    runner = LocalBatchRunner(runtime)
+    batch_id = runner.create_batch(
+        [source], output, ready_discovery(), review_groups=False
+    )
+    real_export = runner._write_series_workbook
+    blocked = True
+
+    def disk_full(db, batch, label):
+        if blocked:
+            raise OSError("disk full")
+        return real_export(db, batch, label)
+
+    monkeypatch.setattr(runner, "_write_series_workbook", disk_full)
+    first = runner.execute_batch(batch_id)
+    assert first["status"] == "EXPORT FAILED — RESUME AVAILABLE"
+    with runtime.sessions() as db:
+        batch = db.get(LocalBatch, batch_id)
+        item = db.scalar(select(LocalBatchItem).where(LocalBatchItem.batch_id == batch_id))
+        assert batch.status == "export_failed"
+        assert item.status == "completed"
+        assert len(list(db.scalars(select(Answer)).all())) == 1
+
+    blocked = False
+    second = runner.resume_batch(batch_id)
+
+    assert second["status"] == "COMPLETED — FLAGS PRESENT"
+    assert (output / "questionnaire_FormSight.xlsx").exists()
+    with runtime.sessions() as db:
+        assert len(list(db.scalars(select(Answer)).all())) == 1
+
+
+def test_v06_upgrade_backs_up_database_and_invalidates_unfinished_v05_batch(
+    tmp_path, monkeypatch
+) -> None:
+    local_app_data = tmp_path / "local-data"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    runtime = create_runtime("http://127.0.0.1:1234")
+    with runtime.sessions() as db:
+        db.add(
+            LocalBatch(
+                id="legacy-running",
+                status="running",
+                output_path=str(tmp_path / "outputs"),
+                review_groups=False,
+                processing_mode="balanced",
+                lmstudio_base_url="http://127.0.0.1:1234",
+                extractor_model_id="qwen",
+                verifier_model_id="gemma",
+                judge_model_id="qwen",
+            )
+        )
+        db.commit()
+    (runtime.root / "schema-v0.6.marker").unlink()
+
+    upgraded = create_runtime("http://127.0.0.1:1234")
+
+    backups = list((upgraded.root / "backups").glob("formsight-local-pre-v0.6-*.db"))
+    assert len(backups) == 1
+    with upgraded.sessions() as db:
+        assert db.get(LocalBatch, "legacy-running").status == "legacy_requires_restart"
 
 
 def test_same_series_label_consolidates_multiple_sources_into_one_workbook(tmp_path, monkeypatch) -> None:

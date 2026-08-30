@@ -4,8 +4,18 @@ import json
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from desktop import model_discovery
+
+
+@pytest.fixture(autouse=True)
+def pass_model_probe(monkeypatch):
+    monkeypatch.setattr(
+        model_discovery,
+        "probe_model_capability",
+        lambda *_args, **_kwargs: (True, "vision + strict JSON passed"),
+    )
 
 
 def loaded_model(
@@ -104,7 +114,7 @@ def test_discovery_reports_authentication_and_offline(monkeypatch) -> None:
     assert model_discovery.discover_models().status == "offline"
 
 
-def test_discovery_requires_independent_non_qwen_verifier(monkeypatch) -> None:
+def test_discovery_offers_explicit_qwen_only_mode_without_verifier(monkeypatch) -> None:
     monkeypatch.setattr(model_discovery, "discover_lmstudio_port", lambda: 5555)
     monkeypatch.setattr(model_discovery, "loopback_binding_only", lambda _port: True)
     payload = {"models": [loaded_model("qwen/qwen3-vl-8b", architecture="qwen3_vl")]}
@@ -118,9 +128,41 @@ def test_discovery_requires_independent_non_qwen_verifier(monkeypatch) -> None:
         ),
     )
     result = model_discovery.discover_models()
-    assert result.status == "verifier_required"
+    assert result.status == "qwen_only"
     assert result.base_url == "http://127.0.0.1:5555"
     assert result.selected_judge == result.selected_vision
+
+
+def test_discovery_rejects_a_verifier_that_fails_image_probe(monkeypatch) -> None:
+    monkeypatch.setattr(model_discovery, "discover_lmstudio_port", lambda: 5555)
+    monkeypatch.setattr(model_discovery, "loopback_binding_only", lambda _port: True)
+    payload = {
+        "models": [
+            loaded_model("qwen/qwen3-vl-8b", architecture="qwen3_vl"),
+            loaded_model("google/gemma-3-4b", architecture="gemma3", vision=True),
+        ]
+    }
+    monkeypatch.setattr(
+        model_discovery.httpx,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200, raise_for_status=lambda: None, json=lambda: payload
+        ),
+    )
+    monkeypatch.setattr(
+        model_discovery,
+        "probe_model_capability",
+        lambda _url, model, **_kwargs: (
+            (False, "400 vision unsupported")
+            if "gemma" in model
+            else (True, "vision + strict JSON passed")
+        ),
+    )
+
+    result = model_discovery.discover_models()
+
+    assert result.status == "model_probe_failed"
+    assert "verifier" in result.message
 
 
 def test_discovery_selects_gemma_verifier_and_reuses_primary_for_judging(monkeypatch) -> None:

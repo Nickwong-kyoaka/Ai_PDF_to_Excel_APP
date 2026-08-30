@@ -3,7 +3,11 @@ from pathlib import Path
 from PIL import Image
 
 from app.config import Settings
-from app.scanner.extractor import QuestionnaireExtractor, chunk_judge_records
+from app.scanner.extractor import (
+    QuestionnaireExtractor,
+    chunk_judge_records,
+    compact_answers_to_items,
+)
 from app.scanner.fusion import FusedAnswer
 
 
@@ -192,6 +196,7 @@ def test_page_conflicts_are_adjudicated_in_one_request(tmp_path):
     extractor.tiebreak_page(Image.new("RGB", (100, 100), "white"), answers)
 
     assert len(calls) == 1
+    assert calls[0]["images"][0].size == (1200, 190)
     assert all(not answer.needs_tiebreak for answer in answers)
     assert [answer.scanner_value for answer in answers] == ["Yes", "No"]
 
@@ -212,3 +217,98 @@ def test_reasonableness_records_are_chunked_for_local_context_limits():
         record["question_id"] for record in records
     ]
     assert all(len(chunk) <= 20 for chunk in chunks)
+
+
+def test_dense_matrix_keeps_every_template_row_as_an_independent_answer():
+    template = [
+        {
+            "template_question_id": f"P3:MATRIX:R{row}",
+            "question_text": f"Matrix row {row}",
+            "answer_type": "matrix",
+            "allowed_options": ["Yes", "No"],
+            "answer_bbox": [0.1, row / 25, 0.9, (row + 1) / 25],
+        }
+        for row in range(1, 20)
+    ]
+    response = {
+        "answers": [
+            {
+                "template_question_id": item["template_question_id"],
+                "value": "Yes" if index % 2 else "No",
+                "blank": False,
+                "confidence": 0.9,
+                "mark_type": "tick",
+            }
+            for index, item in enumerate(template)
+        ]
+    }
+
+    answers = compact_answers_to_items(template, response)
+
+    assert len(answers) == 19
+    assert len({answer["template_question_id"] for answer in answers}) == 19
+
+
+def test_missing_compact_answer_uses_one_targeted_crop_repair(tmp_path, monkeypatch):
+    extractor = make_extractor(tmp_path)
+    extractor.profile.update({"template_mode": True, "verifier_model_id": None})
+    extractor.template_pages["1"] = [
+        {
+            "template_question_id": "P1:Q1",
+            "question_id": "P1:Q1",
+            "question_text": "First",
+            "answer_type": "short_text",
+            "allowed_options": [],
+            "question_bbox": [0.05, 0.05, 0.95, 0.25],
+            "answer_bbox": [0.5, 0.08, 0.9, 0.2],
+        },
+        {
+            "template_question_id": "P1:Q2",
+            "question_id": "P1:Q2",
+            "question_text": "Second",
+            "answer_type": "short_text",
+            "allowed_options": [],
+            "question_bbox": [0.05, 0.3, 0.95, 0.5],
+            "answer_bbox": [0.5, 0.33, 0.9, 0.46],
+        },
+    ]
+    monkeypatch.setattr(
+        "app.scanner.extractor.render_page",
+        lambda *args, **kwargs: Image.new("RGB", (200, 200), "white"),
+    )
+    calls: list[dict] = []
+
+    class Gateway:
+        def chat_json(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return {
+                    "answers": [
+                        {
+                            "template_question_id": "P1:Q1",
+                            "value": "A",
+                            "blank": False,
+                            "confidence": 0.95,
+                        }
+                    ]
+                }
+            return {
+                "answers": [
+                    {
+                        "template_question_id": "P1:Q2",
+                        "value": "B",
+                        "blank": False,
+                        "confidence": 0.92,
+                    }
+                ]
+            }
+
+    extractor.gateway = Gateway()
+    answers, debug = extractor.extract_one_page(
+        Path("survey.pdf"), 1, 1, False, page_ordinal=1
+    )
+
+    assert [answer.scanner_value for answer in answers] == ["A", "B"]
+    assert len(calls) == 2
+    assert len(calls[1]["images"]) == 1
+    assert debug["targeted_repair_used"] is True

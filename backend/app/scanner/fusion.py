@@ -10,7 +10,15 @@ from typing import Any
 from .yolo import Detection
 
 
-SELECTION_TYPES = {"single_choice", "multi_choice", "yes_no", "consent", "scale", "matrix"}
+SELECTION_TYPES = {
+    "single_choice",
+    "multi_choice",
+    "yes_no",
+    "consent",
+    "scale",
+    "matrix",
+    "matrix_row",
+}
 
 
 def clean_text(value: Any) -> str:
@@ -167,6 +175,35 @@ def reconcile_qwen(first: dict[str, Any], second: dict[str, Any] | None) -> tupl
         return first_value, min(0.99, max(first_conf, second_conf) + 0.04), "Two independent Qwen passes agree", False
     chosen = first_value if first_conf >= second_conf else second_value
     return chosen, max(first_conf, second_conf) * 0.72, "Independent Qwen passes disagree", True
+
+
+def fuse_qwen_passes(
+    first_items: list[dict[str, Any]],
+    second_items: list[dict[str, Any]],
+    model_id: str,
+) -> list[FusedAnswer]:
+    """Fuse two sequential passes of one vision model without implying YOLO evidence."""
+
+    second_map = {item_key(item, index): item for index, item in enumerate(second_items)}
+    output: list[FusedAnswer] = []
+    for index, item in enumerate(first_items):
+        value, confidence, reason, conflict = reconcile_qwen(
+            item, second_map.get(item_key(item, index))
+        )
+        output.append(
+            FusedAnswer(
+                item=item,
+                qwen_value=value,
+                yolo_value=None,
+                scanner_value=value,
+                confidence=confidence,
+                reason=reason,
+                evidence=_model_evidence(item, "primary_vision", model_id),
+                needs_review=conflict or confidence < 0.80,
+                needs_tiebreak=conflict,
+            )
+        )
+    return output
 
 
 def fuse_page(

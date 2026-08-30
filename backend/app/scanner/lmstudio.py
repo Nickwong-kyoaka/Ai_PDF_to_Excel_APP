@@ -137,7 +137,9 @@ class LMStudioGateway:
         }
         last_error: Exception | None = None
         with httpx.Client(timeout=self.timeout) as client:
-            for attempt in range(retries + 1):
+            attempt = 0
+            context_reductions = 0
+            while attempt <= retries:
                 try:
                     response = client.post(
                         f"{self.base_url}/chat/completions", headers=self.headers, json=payload
@@ -159,13 +161,19 @@ class LMStudioGateway:
                             "token limit",
                         )
                     )
-                    if context_limited and int(payload["max_tokens"]) > 1024:
+                    if (
+                        context_limited
+                        and int(payload["max_tokens"]) > 1024
+                        and context_reductions < 2
+                    ):
                         payload["max_tokens"] = max(1024, int(payload["max_tokens"]) // 2)
+                        context_reductions += 1
                         last_error = RuntimeError(
                             f"LM Studio context limit; retrying with max_tokens={payload['max_tokens']}"
                         )
-                        if attempt < retries:
-                            continue
+                        # Context-limit responses are immediate and do not consume a slow
+                        # transport retry. This keeps the balanced zero-retry profile robust.
+                        continue
                     response.raise_for_status()
                     message = response.json()["choices"][0]["message"]
                     raw = message.get("content") or message.get("final") or ""
@@ -175,4 +183,5 @@ class LMStudioGateway:
                     if attempt == retries:
                         break
                     time.sleep(min(6.0, 1.5 * (2**attempt)))
+                    attempt += 1
         raise RuntimeError(f"LM Studio request failed: {last_error}")

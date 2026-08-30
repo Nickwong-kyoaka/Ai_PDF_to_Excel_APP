@@ -26,6 +26,53 @@ from .runtime import DesktopRuntime, ensure_local_identity
 ALLOWED_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 
+PROCESSING_PROFILES: dict[str, dict[str, object]] = {
+    "balanced": {
+        "image_max_side": 2000,
+        "page_retry_max_side": 1600,
+        "page_attempts": 2,
+        "verification_mode": "selective",
+        "verifier_confidence_threshold": 0.86,
+        "verifier_audit_interval": 10,
+        "verifier_tile_count": 0,
+        "orientation_mode": "document",
+        "orientation_retries": 0,
+        "request_timeout": 120,
+        "extraction_max_tokens": 3072,
+        "extraction_retries": 0,
+        "adjudication_chunk_size": 24,
+        "adjudication_retries": 0,
+        "judge_max_tokens": 2048,
+        "judge_retries": 0,
+    },
+    "maximum": {
+        "image_max_side": 2400,
+        "page_retry_max_side": 1900,
+        "page_attempts": 2,
+        "verification_mode": "maximum",
+        "verifier_tile_count": 2,
+        "tile_max_tokens": 2560,
+        "tile_retries": 0,
+        "orientation_mode": "model",
+        "orientation_retries": 0,
+        "request_timeout": 180,
+        "extraction_max_tokens": 4096,
+        "extraction_retries": 1,
+        "adjudication_chunk_size": 24,
+        "adjudication_retries": 1,
+        "judge_max_tokens": 2048,
+        "judge_retries": 1,
+    },
+}
+
+
+def processing_profile(mode: str) -> dict[str, object]:
+    try:
+        return dict(PROCESSING_PROFILES[mode])
+    except KeyError as exc:
+        raise ValueError(f"Unknown processing mode: {mode}") from exc
+
+
 @dataclass(slots=True, frozen=True)
 class GroupDraft:
     job_id: str
@@ -106,6 +153,7 @@ class LocalBatchRunner:
         verifier_model_id: str | None = None,
         judge_model_id: str | None = None,
         series_labels: Iterable[str] | None = None,
+        processing_mode: str = "balanced",
     ) -> str:
         source_paths: list[Path] = []
         seen: set[str] = set()
@@ -124,6 +172,7 @@ class LocalBatchRunner:
                 raise ValueError(f"File not found: {source}")
         if discovery.status != "ready" or not discovery.selected_vision or not discovery.selected_verifier:
             raise ValueError(discovery.message or "LM Studio is not ready")
+        performance = processing_profile(processing_mode)
 
         vision_id = extractor_model_id or discovery.selected_vision.api_id
         verifier_id = verifier_model_id or discovery.selected_verifier.api_id
@@ -184,6 +233,7 @@ class LocalBatchRunner:
                 status="preparing",
                 output_path=str(output),
                 review_groups=review_groups,
+                processing_mode=processing_mode,
                 lmstudio_base_url=discovery.base_url,
                 extractor_model_id=vision_id,
                 verifier_model_id=verifier_id,
@@ -218,6 +268,7 @@ class LocalBatchRunner:
             if not batch:
                 raise ValueError("Local batch not found")
             user, profile = ensure_local_identity(db, batch.extractor_model_id, batch.judge_model_id)
+            performance = processing_profile(batch.processing_mode)
             items = list(
                 db.scalars(
                     select(LocalBatchItem)
@@ -254,8 +305,13 @@ class LocalBatchRunner:
                         try:
                             proposals = visual_grouping(
                                 info.page_images,
-                                LMStudioGateway(batch.lmstudio_base_url, ""),
+                                LMStudioGateway(
+                                    batch.lmstudio_base_url,
+                                    "",
+                                    timeout=float(performance["request_timeout"]),
+                                ),
                                 batch.extractor_model_id,
+                                retries=0 if batch.processing_mode == "balanced" else 1,
                             )
                         except Exception as exc:
                             proposals[0].reason += f"; visual grouping unavailable: {str(exc)[:120]}"
@@ -267,10 +323,10 @@ class LocalBatchRunner:
                         "verifier_model_id": batch.verifier_model_id,
                         "judge_model_id": batch.judge_model_id,
                         "quantization": profile.quantization,
-                        "context_length": profile.context_length,
+                        "context_length": 12288 if batch.processing_mode == "balanced" else 16384,
                         "max_concurrency": 1,
-                        "image_max_side": profile.image_max_side,
-                        "verification_mode": "maximum",
+                        "processing_mode": batch.processing_mode,
+                        **performance,
                         "local_desktop": True,
                     }
                     job = Job(
@@ -420,12 +476,12 @@ class LocalBatchRunner:
                     .order_by(LocalBatchItem.order_index.asc())
                 ).all()
             )
-            profile = {
+            profile: dict[str, object] = {
                 "extractor_model_id": batch.extractor_model_id,
                 "verifier_model_id": batch.verifier_model_id,
                 "judge_model_id": batch.judge_model_id,
-                "image_max_side": 3000,
-                "verification_mode": "maximum",
+                "processing_mode": batch.processing_mode,
+                **processing_profile(batch.processing_mode),
             }
             batch.status = "running"
             batch.error = None
@@ -701,6 +757,7 @@ class LocalBatchRunner:
                 "extractor_model_id": batch.extractor_model_id,
                 "verifier_model_id": batch.verifier_model_id,
                 "judge_model_id": batch.judge_model_id,
+                "processing_mode": batch.processing_mode,
                 "items": [
                     {
                         "index": item.order_index,

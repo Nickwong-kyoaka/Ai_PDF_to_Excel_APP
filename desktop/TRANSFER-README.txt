@@ -16,9 +16,10 @@ DESTINATION PC / 目標電腦
 
 3. Recommended RTX 5060 Ti 16 GB settings for both models:
    RTX 5060 Ti 16 GB 建議兩個模型均使用：
-   - Context length: 16384
+   - Context length: 8192 to 12288
    - Flash Attention: enabled
-   - KV cache: system RAM
+   - GPU offload: all model layers
+   - KV cache: GPU/Auto if both models fit; system RAM only if necessary
    Keep both models loaded. FormSight sends requests sequentially, never in parallel.
    保持兩個模型已載入；FormSight 只會順序呼叫，不會平行執行。
 
@@ -36,8 +37,18 @@ DESTINATION PC / 目標電腦
    選取相關檔案列並按「設定系列標籤」。所有相同標籤的 PDF 會合併至同一 Excel；
    每個 PDF 可分別包含一份或多份問卷。
 
-8. Choose an output folder and start scanning. A label such as Study-A creates Study-A_FormSight.xlsx.
-   選擇輸出資料夾並開始掃描；例如 Study-A 標籤會建立 Study-A_FormSight.xlsx。
+8. Choose an output folder. Keep the default Automatic one-take + Balanced choices, then click Start once.
+   The app continues through grouping, scanning, checking, recovery, and Excel output without another click.
+   選擇輸出資料夾，保留預設「全自動一次完成」及「平衡模式」，然後只按一次開始；
+   程式會自動完成分組、掃描、合理性檢查、錯誤恢復及 Excel 輸出，中途毋須再按鍵。
+
+SPEED PROFILES / 速度模式
+
+- Balanced (recommended): Qwen scans every page; Gemma checks uncertain/corrected/matrix pages and
+  a 10% audit sample. Conflicts on one page are judged together.
+  平衡模式（建議）：Qwen 掃描每頁；Gemma 只檢查可疑、更正、矩陣頁及 10% 抽查頁；同頁衝突一次判斷。
+- Maximum accuracy: both models inspect every page. This is slower and should be used only when required.
+  最高準確度：每頁均由兩個模型檢查，速度較慢，只在需要時使用。
 
 PAGE-SERIES REVIEW / 問卷系列分組
 
@@ -52,8 +63,9 @@ PAGE-SERIES REVIEW / 問卷系列分組
 
 LONG-RUN SAFETY / 長時間執行保護
 
-- Models are called sequentially. Context-heavy requests automatically retry with a smaller output budget.
-  模型只會順序呼叫；超出 context 時會自動降低輸出 token 再試。
+- Models are called sequentially. Balanced requests stop after 120 seconds instead of waiting repeatedly;
+  context-limit responses immediately retry with a smaller output budget.
+  模型只會順序呼叫；平衡模式每次請求最多 120 秒，不會長時間重複等待；超出 context 時會立即降低輸出 token 再試。
 - Failed pages retry with a smaller image and then become visible flags without stopping the batch.
   失敗頁面會用較小圖片再試；仍失敗則標記，但不會停止整個批次。
 - Completed pages and partial series Excel files are checkpointed. Reopening the app offers recovery.

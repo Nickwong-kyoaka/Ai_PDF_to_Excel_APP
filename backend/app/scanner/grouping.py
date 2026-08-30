@@ -32,6 +32,8 @@ def visual_grouping(
     page_paths: list[Path],
     gateway: LMStudioGateway,
     model_id: str,
+    *,
+    retries: int = 1,
 ) -> list[ProposedGroup]:
     if len(page_paths) <= 1:
         return [ProposedGroup(1, 1, None, 0.8, "Single-page document")]
@@ -48,7 +50,13 @@ Use repeated cover/header structure and visible participant IDs, but do not inve
 Return {{"starts":[{{"page":1,"participant_id":null,"confidence":0.0,"reason":"short visual reason"}}]}}.
 Only return start pages inside this batch. Page 1 of the whole PDF must be a start.
 """.strip()
-        result = gateway.chat_json(model=model_id, prompt=prompt, images=[contact_sheet(batch, first_page)], max_tokens=1200, retries=1)
+        result = gateway.chat_json(
+            model=model_id,
+            prompt=prompt,
+            images=[contact_sheet(batch, first_page)],
+            max_tokens=1200,
+            retries=retries,
+        )
         for item in result.get("starts", []):
             if not isinstance(item, dict):
                 continue

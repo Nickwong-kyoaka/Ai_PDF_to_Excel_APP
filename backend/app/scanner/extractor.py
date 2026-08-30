@@ -12,10 +12,25 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings
 from ..models import Answer, Job, QuestionnaireGroup, Rule
-from .fusion import FusedAnswer, clean_text, fuse_page, fuse_vision_models, item_key, valid_bbox
+from .fusion import (
+    FusedAnswer,
+    clean_text,
+    fuse_page,
+    fuse_primary_only,
+    fuse_vision_models,
+    item_key,
+    item_value,
+    valid_bbox,
+)
 from .legacy import V14Compatibility
 from .lmstudio import LMStudioGateway
-from .prompts import conflict_prompt, extraction_prompt, judge_prompt, orientation_prompt
+from .prompts import (
+    conflict_prompt,
+    extraction_prompt,
+    judge_prompt,
+    orientation_prompt,
+    page_conflicts_prompt,
+)
 from .rules import evaluate_rule, generic_findings
 from .yolo import YoloMarkDetector
 
@@ -103,7 +118,11 @@ class QuestionnaireExtractor:
     ):
         self.settings = settings
         self.profile = profile
-        self.gateway = LMStudioGateway(settings.lmstudio_base_url, settings.lmstudio_token)
+        self.gateway = LMStudioGateway(
+            settings.lmstudio_base_url,
+            settings.lmstudio_token,
+            timeout=float(profile.get("request_timeout", 600)),
+        )
         self.yolo = YoloMarkDetector(yolo_weights or settings.yolo_weights)
         self.legacy = V14Compatibility(settings.legacy_v14_path)
         self.manage_models = manage_models
@@ -115,13 +134,15 @@ class QuestionnaireExtractor:
             self.progress_callback(stage, max(0.0, min(1.0, progress)), message)
 
     def orient(self, image: Image.Image) -> Image.Image:
+        if self.profile.get("orientation_mode", "model") != "model":
+            return image
         try:
             result = self.gateway.chat_json(
                 model=self.profile["extractor_model_id"],
                 prompt=orientation_prompt(),
                 images=[image.copy().resize((min(image.width, 1200), min(image.height, 1200)))],
                 max_tokens=100,
-                retries=1,
+                retries=int(self.profile.get("orientation_retries", 1)),
             )
             rotation = int(result.get("rotation_degrees") or 0)
             if rotation in {90, 180, 270}:
@@ -149,24 +170,27 @@ class QuestionnaireExtractor:
                 model=selected_model,
                 prompt=prompt,
                 images=[image],
-                max_tokens=4096,
-                retries=2,
+                max_tokens=int(self.profile.get("extraction_max_tokens", 4096)),
+                retries=int(self.profile.get("extraction_retries", 2)),
             )
         except Exception as exc:
             full_page_error = exc
 
         items = response.get("items")
-        if include_tiles and (full_page_error or not isinstance(items, list) or not items):
+        tile_count = int(self.profile.get("verifier_tile_count", 4))
+        if include_tiles and tile_count > 0 and (full_page_error or not isinstance(items, list) or not items):
             items = []
             tile_errors: list[str] = []
-            for tile_number, tile in enumerate(self.legacy.zoom_tiles(image, max_tiles=4), start=1):
+            for tile_number, tile in enumerate(
+                self.legacy.zoom_tiles(image, max_tiles=tile_count), start=1
+            ):
                 try:
                     tile_response = self.gateway.chat_json(
                         model=selected_model,
                         prompt=f"{prompt}\nThis is zoom region {tile_number}; return only questions visible in this region.",
                         images=[tile],
-                        max_tokens=3072,
-                        retries=1,
+                        max_tokens=int(self.profile.get("tile_max_tokens", 3072)),
+                        retries=int(self.profile.get("tile_retries", 1)),
                     )
                     tile_items = tile_response.get("items")
                     if isinstance(tile_items, list):
@@ -184,6 +208,44 @@ class QuestionnaireExtractor:
             for index, item in enumerate(items)
             if isinstance(item, dict)
         ]
+
+    def should_verify_page(self, items: list[dict[str, Any]], page_number: int) -> bool:
+        """Select pages needing an independent vision pass in balanced mode."""
+
+        if self.profile.get("verification_mode", "maximum") != "selective":
+            return True
+        if not items:
+            return True
+        audit_interval = max(0, int(self.profile.get("verifier_audit_interval", 10)))
+        if audit_interval and page_number % audit_interval == 0:
+            return True
+        threshold = float(self.profile.get("verifier_confidence_threshold", 0.86))
+        correction_words = {
+            "ambiguous",
+            "unclear",
+            "corrected",
+            "correction",
+            "overwrite",
+            "overwritten",
+            "strikeout",
+            "crossed out",
+            "更正",
+            "塗改",
+            "劃掉",
+            "划掉",
+            "模糊",
+        }
+        for item in items:
+            value = item_value(item)
+            meaningful = not bool(item.get("blank")) or value not in (None, "", [])
+            if meaningful and float(item.get("confidence") or 0) < threshold:
+                return True
+            if clean_text(item.get("answer_type")) == "matrix":
+                return True
+            reason = clean_text(item.get("reason")).casefold()
+            if any(word in reason for word in correction_words):
+                return True
+        return False
 
     def tiebreak(self, image: Image.Image, fused: FusedAnswer) -> FusedAnswer:
         bbox = valid_bbox(fused.item.get("answer_bbox")) or valid_bbox(fused.item.get("question_bbox"))
@@ -216,6 +278,87 @@ class QuestionnaireExtractor:
             fused.needs_review = True
         return fused
 
+    def tiebreak_page(self, image: Image.Image, answers: list[FusedAnswer]) -> None:
+        """Adjudicate page conflicts in bounded batches instead of one call per answer."""
+
+        conflicts = [answer for answer in answers if answer.needs_tiebreak]
+        if not conflicts:
+            return
+        chunk_size = max(1, int(self.profile.get("adjudication_chunk_size", 24)))
+        for offset in range(0, len(conflicts), chunk_size):
+            chunk = conflicts[offset : offset + chunk_size]
+            records: list[dict[str, Any]] = []
+            by_id: dict[str, FusedAnswer] = {}
+            for index, fused in enumerate(chunk, start=1):
+                conflict_id = item_key(fused.item, offset + index - 1)
+                independent_value = (
+                    fused.verifier_value if fused.verifier_model_id else fused.yolo_value
+                )
+                records.append(
+                    {
+                        "question_id": conflict_id,
+                        "question_text": clean_text(fused.item.get("question_text"))[:500],
+                        "answer_type": clean_text(fused.item.get("answer_type")),
+                        "answer_bbox": valid_bbox(fused.item.get("answer_bbox"))
+                        or valid_bbox(fused.item.get("question_bbox")),
+                        "candidates": [fused.qwen_value, independent_value],
+                    }
+                )
+                by_id[conflict_id] = fused
+            try:
+                result = self.gateway.chat_json(
+                    model=self.profile["extractor_model_id"],
+                    prompt=page_conflicts_prompt(records),
+                    images=[image],
+                    max_tokens=min(1800, max(900, 300 + len(records) * 90)),
+                    retries=int(self.profile.get("adjudication_retries", 1)),
+                )
+                resolved_ids: set[str] = set()
+                for item in result.get("results", []):
+                    if not isinstance(item, dict):
+                        continue
+                    conflict_id = str(item.get("question_id") or "")
+                    fused = by_id.get(conflict_id)
+                    if not fused:
+                        continue
+                    resolved_ids.add(conflict_id)
+                    confidence = max(0.0, min(1.0, float(item.get("confidence") or 0)))
+                    if item.get("resolved") and confidence >= 0.82:
+                        resolved = item.get("value")
+                        independent_value = (
+                            fused.verifier_value if fused.verifier_model_id else fused.yolo_value
+                        )
+                        fused.scanner_value = resolved
+                        fused.confidence = confidence
+                        fused.reason += (
+                            "; batched page adjudication: " + clean_text(item.get("reason"))
+                        )
+                        fused.needs_review = normalized_mismatch(
+                            resolved, fused.qwen_value, independent_value
+                        )
+                        fused.needs_tiebreak = False
+                        fused.evidence.append(
+                            {
+                                "source": "primary_adjudicator",
+                                "model_id": self.profile["extractor_model_id"],
+                                "label": "batched page conflict adjudication",
+                                "bbox": valid_bbox(fused.item.get("answer_bbox"))
+                                or valid_bbox(fused.item.get("question_bbox"))
+                                or [0, 0, 1, 1],
+                                "confidence": confidence,
+                            }
+                        )
+                    else:
+                        fused.needs_review = True
+                for conflict_id, fused in by_id.items():
+                    if conflict_id not in resolved_ids:
+                        fused.reason += "; batched adjudicator omitted this conflict"
+                        fused.needs_review = True
+            except Exception as exc:
+                for fused in chunk:
+                    fused.reason += f"; batched tiebreak unavailable: {str(exc)[:100]}"
+                    fused.needs_review = True
+
     def extract_one_page(
         self,
         source: Path,
@@ -233,6 +376,7 @@ class QuestionnaireExtractor:
         primary_model_id = self.profile["extractor_model_id"]
         verifier_model_id = self.profile.get("verifier_model_id")
         model_errors: dict[str, str] = {}
+        verifier_skipped = False
         if verifier_model_id:
             try:
                 first = self.extract_pass(
@@ -246,24 +390,32 @@ class QuestionnaireExtractor:
             except Exception as exc:
                 first = []
                 model_errors["primary"] = str(exc)
-            try:
-                second = self.extract_pass(
-                    image,
-                    page_number,
-                    total_pages,
-                    "independent verifier vision model pass",
-                    True,
-                    verifier_model_id,
-                )
-            except Exception as exc:
+            run_verifier = self.should_verify_page(first, page_number)
+            if run_verifier:
+                try:
+                    second = self.extract_pass(
+                        image,
+                        page_number,
+                        total_pages,
+                        "independent verifier vision model pass",
+                        True,
+                        verifier_model_id,
+                    )
+                except Exception as exc:
+                    second = []
+                    model_errors["verifier"] = str(exc)
+            else:
                 second = []
-                model_errors["verifier"] = str(exc)
+                verifier_skipped = True
             if not first and not second:
                 raise RuntimeError(f"Both vision model passes failed: {model_errors}")
             detections = []
-            fused_answers = fuse_vision_models(
-                first, second, primary_model_id, str(verifier_model_id)
-            )
+            if verifier_skipped:
+                fused_answers = fuse_primary_only(first, primary_model_id)
+            else:
+                fused_answers = fuse_vision_models(
+                    first, second, primary_model_id, str(verifier_model_id)
+                )
         else:
             first = self.extract_pass(
                 image, page_number, total_pages, "primary vision model pass", False, primary_model_id
@@ -273,14 +425,14 @@ class QuestionnaireExtractor:
             )
             detections = self.yolo.detect(image)
             fused_answers = fuse_page(first, second, detections, yolo_available)
-        for fused in fused_answers:
-            if fused.needs_tiebreak:
-                self.tiebreak(image, fused)
+        self.tiebreak_page(image, fused_answers)
         return fused_answers, {
             "primary_model_id": primary_model_id,
             "primary": first,
             "verifier_model_id": verifier_model_id,
             "verifier": second,
+            "verifier_skipped": verifier_skipped,
+            "verification_mode": self.profile.get("verification_mode", "maximum"),
             "model_errors": model_errors,
             "yolo": [detection.as_dict() for detection in detections],
         }
@@ -340,14 +492,19 @@ class QuestionnaireExtractor:
                 debug_payload: dict[str, Any] = {}
                 final_error: Exception | None = None
                 max_side = int(self.profile.get("image_max_side", 3000))
-                for page_attempt, retry_side in enumerate((max_side, min(max_side, 2200)), start=1):
+                page_attempts = max(1, int(self.profile.get("page_attempts", 2)))
+                retry_side = min(max_side, int(self.profile.get("page_retry_max_side", 2200)))
+                attempt_sides = [max_side]
+                if page_attempts > 1 and retry_side != max_side:
+                    attempt_sides.append(retry_side)
+                for page_attempt, attempt_side in enumerate(attempt_sides, start=1):
                     try:
                         fused_answers, debug_payload = self.extract_one_page(
                             source,
                             page_number,
                             job.page_count,
                             yolo_available,
-                            image_max_side=retry_side,
+                            image_max_side=attempt_side,
                         )
                         debug_payload["page_attempt"] = page_attempt
                         debug_payload["checkpoint_complete"] = True
@@ -358,9 +515,9 @@ class QuestionnaireExtractor:
                         debug_payload = {
                             "page_error": str(exc),
                             "page_attempt": page_attempt,
-                            "retry_image_max_side": retry_side,
+                            "retry_image_max_side": attempt_side,
                         }
-                        if page_attempt == 1:
+                        if page_attempt < len(attempt_sides):
                             self.notify(
                                 "extracting",
                                 job.progress,
@@ -495,8 +652,8 @@ class QuestionnaireExtractor:
                     response = self.gateway.chat_json(
                         model=self.profile["judge_model_id"],
                         prompt=judge_prompt(chunk, chunk_findings),
-                        max_tokens=2048,
-                        retries=2,
+                        max_tokens=int(self.profile.get("judge_max_tokens", 2048)),
+                        retries=int(self.profile.get("judge_retries", 2)),
                     )
                     results.update(
                         {

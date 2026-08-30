@@ -124,6 +124,38 @@ class FusedAnswer:
     verifier_model_id: str | None = None
 
 
+def fuse_primary_only(
+    primary_items: list[dict[str, Any]],
+    primary_model_id: str,
+) -> list[FusedAnswer]:
+    """Keep high-confidence primary results when balanced mode skips a page verifier.
+
+    This is deliberately distinct from dual-model agreement: the reason and evidence
+    make it clear that no independent visual confirmation was performed.
+    """
+
+    output: list[FusedAnswer] = []
+    for item in primary_items:
+        value = item_value(item)
+        confidence = max(0.0, min(1.0, float(item.get("confidence") or 0) * 0.90))
+        output.append(
+            FusedAnswer(
+                item=item,
+                qwen_value=value,
+                yolo_value=None,
+                scanner_value=value,
+                confidence=confidence,
+                reason="Balanced mode: high-confidence primary extraction; verifier skipped",
+                evidence=_model_evidence(item, "primary_vision", primary_model_id),
+                needs_review=confidence < 0.80,
+                needs_tiebreak=False,
+                verifier_value=None,
+                verifier_model_id=None,
+            )
+        )
+    return output
+
+
 def reconcile_qwen(first: dict[str, Any], second: dict[str, Any] | None) -> tuple[Any, float, str, bool]:
     first_value = item_value(first)
     first_conf = float(first.get("confidence") or 0)

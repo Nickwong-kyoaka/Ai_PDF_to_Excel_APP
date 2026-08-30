@@ -54,6 +54,9 @@ class FakeExtractor:
         assert profile["extractor_model_id"] == "qwen-vision-loaded"
         assert profile["verifier_model_id"] == "gemma-verifier-loaded"
         assert profile["judge_model_id"] == "qwen-vision-loaded"
+        assert profile["verification_mode"] == "selective"
+        assert profile["request_timeout"] == 120
+        assert profile["image_max_side"] == 2000
         self.yolo = FakeYolo()
 
     def extract_job(self, db, job) -> None:
@@ -109,6 +112,10 @@ def test_mixed_batch_writes_one_corresponding_workbook_per_input(tmp_path, monke
     batch_id = runner.create_batch(
         [first, second, broken], output, ready_discovery(), review_groups=False
     )
+    with runtime.sessions() as db:
+        created = db.get(LocalBatch, batch_id)
+        assert created.processing_mode == "balanced"
+        assert created.review_groups is False
     result = runner.execute_batch(batch_id)
 
     assert result is not None

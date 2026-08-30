@@ -251,6 +251,7 @@ class LocalBatch(Base):
     status: Mapped[str] = mapped_column(String(40), default="preparing", nullable=False)
     output_path: Mapped[str] = mapped_column(Text, nullable=False)
     review_groups: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    processing_mode: Mapped[str] = mapped_column(String(32), default="balanced", nullable=False)
     lmstudio_base_url: Mapped[str] = mapped_column(String(255), nullable=False)
     extractor_model_id: Mapped[str] = mapped_column(String(255), nullable=False)
     verifier_model_id: Mapped[str | None] = mapped_column(String(255))

@@ -59,6 +59,22 @@ If the crop cannot establish the physical mark, resolved must be false.
 """.strip()
 
 
+def page_conflicts_prompt(conflicts: list[dict[str, Any]]) -> str:
+    return f"""
+Resolve only the listed mark-reading conflicts from this full questionnaire page.
+Use each normalized answer_bbox/question_bbox to inspect the matching physical mark.
+Do not re-extract unrelated questions and do not invent answers.
+
+Conflicts: {json.dumps(conflicts, ensure_ascii=False)}
+
+Return one JSON object:
+{{"results":[{{"question_id":"...","value":null,"confidence":0.0,
+"reason":"short visible mark evidence","resolved":true}}]}}.
+Return exactly one result per supplied question_id. If the image cannot establish a value,
+set resolved=false and value=null. JSON only.
+""".strip()
+
+
 def judge_prompt(items: list[dict[str, Any]], deterministic_findings: list[dict[str, Any]]) -> str:
     return f"""
 Check whether the extracted questionnaire answers are reasonable. This is data-quality review, not medical diagnosis.

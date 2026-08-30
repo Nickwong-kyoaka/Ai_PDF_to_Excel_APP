@@ -99,6 +99,11 @@ def create_runtime(base_url: str) -> DesktopRuntime:
         }
         if "verifier_model_id" not in batch_columns:
             connection.exec_driver_sql("ALTER TABLE local_batches ADD COLUMN verifier_model_id VARCHAR(255)")
+        if "processing_mode" not in batch_columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE local_batches ADD COLUMN processing_mode VARCHAR(32) "
+                "NOT NULL DEFAULT 'balanced'"
+            )
         answer_columns = {
             str(row[1])
             for row in connection.exec_driver_sql("PRAGMA table_info(answers)").fetchall()
@@ -145,10 +150,10 @@ def ensure_local_identity(db: Session, extractor_model_id: str, judge_model_id: 
             extractor_model_id=extractor_model_id,
             judge_model_id=judge_model_id,
             quantization="auto",
-            context_length=32768,
+            context_length=12288,
             max_concurrency=1,
-            image_max_side=3000,
-            verification_mode="maximum",
+            image_max_side=2000,
+            verification_mode="selective",
             approved=True,
             is_default=True,
         )
@@ -156,5 +161,8 @@ def ensure_local_identity(db: Session, extractor_model_id: str, judge_model_id: 
     else:
         profile.extractor_model_id = extractor_model_id
         profile.judge_model_id = judge_model_id
+        profile.context_length = 12288
+        profile.image_max_side = 2000
+        profile.verification_mode = "selective"
     db.commit()
     return user, profile

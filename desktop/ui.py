@@ -12,7 +12,6 @@ from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -73,7 +72,12 @@ TEXT = {
         "files": "Input questionnaires",
         "output": "Output folder",
         "browse": "Browse…",
-        "review": "Review page groups before scanning",
+        "run_mode": "Run mode",
+        "auto_one_take": "Automatic one-take — no pauses (recommended)",
+        "review_first": "Review page groups before scanning",
+        "performance": "Processing profile",
+        "balanced": "Balanced — selective verifier (recommended)",
+        "maximum": "Maximum accuracy — verify every page",
         "vision": "Primary vision model + judge",
         "judge": "Independent non-Qwen verifier",
         "start": "Start Scan",
@@ -93,7 +97,7 @@ TEXT = {
         "drop_hint": "Drop files or folders anywhere in this window",
         "file_summary_empty": "No questionnaires added yet",
         "file_summary": "{count} input file(s) → {series} labelled series workbook(s)",
-        "output_hint": "PDFs with the same series label are combined into one workbook; each PDF may contain one or many questionnaires.",
+        "output_hint": "Automatic one-take continues from grouping through Excel without another click. PDFs with the same series label are combined into one workbook.",
         "label_help": "Select one or more rows, then assign the same label to combine them.",
         "log": "Run log",
         "select_files": "Select questionnaires",
@@ -124,7 +128,12 @@ TEXT = {
         "files": "輸入問卷",
         "output": "輸出資料夾",
         "browse": "瀏覽…",
-        "review": "掃描前檢查頁面分組",
+        "run_mode": "執行模式",
+        "auto_one_take": "全自動一次完成 — 中途不停頓（建議）",
+        "review_first": "掃描前檢查頁面分組",
+        "performance": "處理模式",
+        "balanced": "平衡模式 — 只驗證可疑頁面（建議）",
+        "maximum": "最高準確度 — 每頁雙模型驗證",
         "vision": "主要視覺模型兼合理性判斷",
         "judge": "獨立非 Qwen 驗證模型",
         "start": "開始掃描",
@@ -144,7 +153,7 @@ TEXT = {
         "drop_hint": "可將檔案或資料夾拖放到此視窗任何位置",
         "file_summary_empty": "尚未加入問卷",
         "file_summary": "{count} 個輸入檔案 → {series} 個系列 Excel 活頁簿",
-        "output_hint": "相同系列標籤的 PDF 會合併至同一活頁簿；每個 PDF 可包含一份或多份問卷。",
+        "output_hint": "全自動模式按開始後會由分組一直執行至 Excel，中途毋須再按鍵；相同系列標籤的 PDF 會合併至同一活頁簿。",
         "label_help": "選取一列或多列，再設定相同標籤即可合併輸出。",
         "log": "執行記錄",
         "select_files": "選擇問卷",
@@ -688,9 +697,14 @@ class MainWindow(QMainWindow):
         output_line.addWidget(self.output_edit, 1)
         output_line.addWidget(self.output_browse_button)
         output_layout.addLayout(output_line)
-        self.review_checkbox = QCheckBox()
-        self.review_checkbox.setChecked(True)
-        output_layout.addWidget(self.review_checkbox)
+        mode_form = QFormLayout()
+        self.run_mode_label = QLabel()
+        self.run_mode_combo = QComboBox()
+        self.performance_label = QLabel()
+        self.performance_combo = QComboBox()
+        mode_form.addRow(self.run_mode_label, self.run_mode_combo)
+        mode_form.addRow(self.performance_label, self.performance_combo)
+        output_layout.addLayout(mode_form)
         self.output_hint_label = QLabel()
         self.output_hint_label.setObjectName("muted")
         self.output_hint_label.setWordWrap(True)
@@ -802,7 +816,20 @@ class MainWindow(QMainWindow):
         self.set_label_button.setText(self.tr("set_label"))
         self.output_label.setText(self.tr("output"))
         self.output_browse_button.setText(self.tr("browse"))
-        self.review_checkbox.setText(self.tr("review"))
+        self.run_mode_label.setText(self.tr("run_mode"))
+        self.performance_label.setText(self.tr("performance"))
+        run_mode = self.run_mode_combo.currentData() or "automatic"
+        self.run_mode_combo.clear()
+        self.run_mode_combo.addItem(self.tr("auto_one_take"), "automatic")
+        self.run_mode_combo.addItem(self.tr("review_first"), "review")
+        run_index = self.run_mode_combo.findData(run_mode)
+        self.run_mode_combo.setCurrentIndex(max(0, run_index))
+        performance_mode = self.performance_combo.currentData() or "balanced"
+        self.performance_combo.clear()
+        self.performance_combo.addItem(self.tr("balanced"), "balanced")
+        self.performance_combo.addItem(self.tr("maximum"), "maximum")
+        performance_index = self.performance_combo.findData(performance_mode)
+        self.performance_combo.setCurrentIndex(max(0, performance_index))
         self.cancel_button.setText(self.tr("cancel"))
         self.resume_button.setText(self.tr("resume"))
         self.open_button.setText(self.tr("open"))
@@ -879,7 +906,7 @@ class MainWindow(QMainWindow):
             (
                 f"● {self.tr('yolo_ready')}\n"
                 "Primary → verifier → cropped adjudication → reasonableness\n"
-                "Recommended: Q4 · 16k context · Flash Attention · KV cache in RAM"
+                "Recommended: Q4 · 8k–12k context · Flash Attention · full GPU offload"
                 if ready
                 else f"● {self.tr('qwen_only')}"
             )
@@ -1104,7 +1131,8 @@ class MainWindow(QMainWindow):
         self.output_ready = None
         self.open_button.setEnabled(False)
         sources = list(self.paths)
-        review = self.review_checkbox.isChecked()
+        review = self.run_mode_combo.currentData() == "review"
+        processing_mode = str(self.performance_combo.currentData() or "balanced")
         vision_id = str(self.vision_combo.currentData())
         verifier_id = str(self.judge_combo.currentData())
         discovery = self.discovery
@@ -1119,6 +1147,7 @@ class MainWindow(QMainWindow):
                 verifier_model_id=verifier_id,
                 judge_model_id=vision_id,
                 series_labels=list(self.series_labels),
+                processing_mode=processing_mode,
             )
             if review:
                 return "prepared", batch_id
@@ -1254,7 +1283,8 @@ class MainWindow(QMainWindow):
             self.set_label_button,
             self.file_table,
             self.output_browse_button,
-            self.review_checkbox,
+            self.run_mode_combo,
+            self.performance_combo,
             self.vision_combo,
             self.judge_combo,
             self.refresh_button,

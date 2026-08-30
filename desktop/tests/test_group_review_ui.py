@@ -65,3 +65,15 @@ def test_bulk_series_label_updates_output_preview(tmp_path, monkeypatch) -> None
     assert "1 labelled series workbook" in window.file_summary_label.text()
     window.close()
     app.processEvents()
+
+
+def test_automatic_balanced_mode_is_the_default() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(auto_detect=False)
+
+    assert window.run_mode_combo.currentData() == "automatic"
+    assert window.performance_combo.currentData() == "balanced"
+    assert "no pauses" in window.run_mode_combo.currentText()
+
+    window.close()
+    app.processEvents()

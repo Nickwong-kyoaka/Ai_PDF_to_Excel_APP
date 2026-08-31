@@ -231,6 +231,15 @@ def write_series_excel(
             else []
         )
         if item_groups:
+            focus_region_count = int(
+                (
+                    (dict(item_job.profile_snapshot or {}).get("focus_regions_v1") or {}).get(
+                        "region_count", 0
+                    )
+                )
+                if item_job
+                else 0
+            )
             for group in item_groups:
                 grouping_rows.append(
                     {
@@ -245,6 +254,7 @@ def write_series_excel(
                         "Participant_ID": group.participant_id,
                         "Grouping_Confidence": item.grouping_confidence or group.confidence,
                         "Template_Variant": item.template_variant,
+                        "Focus_Region_Count": focus_region_count,
                         "Status": item.status,
                         "Reason_or_Skip": item.error or item.grouping_reason or group.reason,
                     }
@@ -263,6 +273,7 @@ def write_series_excel(
                     "Participant_ID": None,
                     "Grouping_Confidence": item.grouping_confidence,
                     "Template_Variant": item.template_variant,
+                    "Focus_Region_Count": 0,
                     "Status": item.status,
                     "Reason_or_Skip": item.error or item.grouping_reason,
                 }
@@ -552,9 +563,25 @@ def write_series_excel(
         for item in items
     ]
     settings_rows = [
-        {"Setting": "FormSight_Version", "Value": "0.6.0"},
+        {"Setting": "FormSight_Version", "Value": "0.6.1"},
         {"Setting": "Processing_Mode", "Value": batch.processing_mode},
         {"Setting": "Automatic_Safe_Skip", "Value": not batch.review_groups},
+        {"Setting": "Focus_Review_Selected", "Value": batch.review_focus},
+        {
+            "Setting": "Focus_Regions_Selected",
+            "Value": sum(
+                int(
+                    (dict(job.profile_snapshot or {}).get("focus_regions_v1") or {}).get(
+                        "region_count", 0
+                    )
+                )
+                for job in jobs
+            ),
+        },
+        {
+            "Setting": "Focus_Fallback",
+            "Value": "FULL_PAGE_WHEN_UNMARKED",
+        },
         {"Setting": "LM_Studio", "Value": batch.lmstudio_base_url},
         {"Setting": "Primary_Vision_Model", "Value": batch.extractor_model_id},
         {"Setting": "Selective_Verifier_Model", "Value": batch.verifier_model_id},
@@ -696,6 +723,7 @@ def write_series_excel(
         "Participant_ID",
         "Grouping_Confidence",
         "Template_Variant",
+        "Focus_Region_Count",
         "Status",
         "Reason_or_Skip",
     ]

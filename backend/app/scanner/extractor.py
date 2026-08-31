@@ -124,6 +124,64 @@ def labeled_crop_sheet(
     return sheet
 
 
+def build_focus_crop_sheet(
+    image: Image.Image,
+    regions: list[list[float]],
+    *,
+    max_side: int = 2200,
+) -> Image.Image:
+    """Build one compact page containing only operator-selected normalized regions."""
+
+    boxes = [bbox for bbox in (valid_bbox(region) for region in regions) if bbox]
+    if not boxes:
+        return image
+    crops = [crop_bbox(image, bbox, padding=0.012).convert("RGB") for bbox in boxes]
+    if len(crops) == 1:
+        focused = crops[0]
+    else:
+        columns = 2 if len(crops) > 1 else 1
+        cell_width = min(900, max(320, max(crop.width for crop in crops) + 24))
+        prepared: list[Image.Image] = []
+        for crop in crops:
+            candidate = crop.copy()
+            candidate.thumbnail((cell_width - 24, 920), Image.Resampling.LANCZOS)
+            prepared.append(candidate)
+        row_count = (len(prepared) + columns - 1) // columns
+        row_heights = [
+            max(
+                (prepared[index].height for index in range(row * columns, min(len(prepared), (row + 1) * columns))),
+                default=1,
+            )
+            + 40
+            for row in range(row_count)
+        ]
+        focused = Image.new("RGB", (columns * cell_width, sum(row_heights)), "white")
+        draw = ImageDraw.Draw(focused)
+        y = 0
+        for row, row_height in enumerate(row_heights):
+            for column in range(columns):
+                index = row * columns + column
+                if index >= len(prepared):
+                    break
+                crop = prepared[index]
+                x = column * cell_width
+                draw.rectangle(
+                    (x + 3, y + 3, x + cell_width - 3, y + row_height - 3),
+                    outline="#52756f",
+                    width=2,
+                )
+                draw.text((x + 12, y + 10), f"Focus {index + 1}", fill="black")
+                focused.paste(crop, (x + 12, y + 34))
+            y += row_height
+    if max(focused.size) > max_side:
+        ratio = max_side / max(focused.size)
+        focused = focused.resize(
+            (max(1, round(focused.width * ratio)), max(1, round(focused.height * ratio))),
+            Image.Resampling.LANCZOS,
+        )
+    return focused
+
+
 def sanitize_item(item: dict[str, Any], fallback_id: str) -> dict[str, Any]:
     allowed_options = item.get("allowed_options") if isinstance(item.get("allowed_options"), list) else []
     selected_options = item.get("selected_options") if isinstance(item.get("selected_options"), list) else []
@@ -263,6 +321,23 @@ class QuestionnaireExtractor:
             if eta is not None:
                 timing += f" · ETA {eta / 60:.1f}m"
             self.progress_callback(stage, bounded, f"{message} · {timing}")
+
+    def apply_focus_regions(
+        self, image: Image.Image, page_ordinal: int
+    ) -> tuple[Image.Image, list[list[float]]]:
+        page_regions = self.profile.get("focus_regions") or {}
+        raw_regions = page_regions.get(str(page_ordinal), []) if isinstance(page_regions, dict) else []
+        regions = [bbox for bbox in (valid_bbox(value) for value in raw_regions) if bbox]
+        if not regions:
+            return image, []
+        return (
+            build_focus_crop_sheet(
+                image,
+                regions,
+                max_side=int(self.profile.get("image_max_side", 2200)),
+            ),
+            regions,
+        )
 
     def orient(self, image: Image.Image) -> Image.Image:
         if self.profile.get("orientation_mode", "model") != "model":
@@ -606,18 +681,21 @@ class QuestionnaireExtractor:
         page_ordinal: int | None = None,
         force_verifier: bool = False,
     ) -> tuple[list[FusedAnswer], dict[str, Any]]:
+        ordinal = page_ordinal or page_number
         image = render_page(
             source,
             page_number,
             image_max_side or int(self.profile.get("image_max_side", 3000)),
         )
-        image = self.orient(self.legacy.enhance(image))
+        original_size = image.size
+        image = self.legacy.enhance(image)
+        image, focus_regions = self.apply_focus_regions(image, ordinal)
+        image = self.orient(image)
         primary_model_id = self.profile["extractor_model_id"]
         verifier_model_id = self.profile.get("verifier_model_id")
         model_errors: dict[str, str] = {}
         verifier_skipped = False
         repair_used = False
-        ordinal = page_ordinal or page_number
         template_items: list[dict[str, Any]] | None = None
         if self.profile.get("template_mode"):
             template_items = self.template_pages.get(str(ordinal))
@@ -770,6 +848,9 @@ class QuestionnaireExtractor:
             "verification_mode": self.profile.get("verification_mode", "maximum"),
             "template_mode": bool(template_items),
             "page_ordinal": ordinal,
+            "focus_regions_applied": focus_regions,
+            "focus_original_size": list(original_size),
+            "focus_model_image_size": list(image.size),
             "template_items": template_items or [],
             "geometry": geometry_debug,
             "model_calls": self.model_calls,
@@ -823,7 +904,11 @@ class QuestionnaireExtractor:
                         page_number,
                         int(self.profile.get("image_max_side", 2200)),
                     )
-                    template_image = self.orient(self.legacy.enhance(template_image))
+                    template_image = self.legacy.enhance(template_image)
+                    template_image, _focus_regions = self.apply_focus_regions(
+                        template_image, page_ordinal
+                    )
+                    template_image = self.orient(template_image)
                     self.discover_template_schema(template_image, page_ordinal)
                     snapshot = dict(job.profile_snapshot or {})
                     snapshot["series_template_v1"] = {

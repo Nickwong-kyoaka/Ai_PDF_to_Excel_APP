@@ -7,8 +7,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox
 from PIL import Image
 
-from desktop.runner import GroupDraft
-from desktop.ui import GroupReviewDialog, MainWindow
+from desktop.runner import FocusPageDraft, GroupDraft
+from desktop.ui import FocusReviewDialog, GroupReviewDialog, MainWindow
 
 
 def draft(job_id: str, source: str, page_count: int) -> GroupDraft:
@@ -80,4 +80,30 @@ def test_automatic_balanced_mode_is_the_default() -> None:
     assert window._selected_server_target() == "192.168.1.80:1234"
 
     window.close()
+    app.processEvents()
+
+
+def test_focus_dialog_compares_first_two_samples_and_keeps_normalized_boxes(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    first = tmp_path / "questionnaire-1-page-1.jpg"
+    second = tmp_path / "questionnaire-2-page-1.jpg"
+    Image.new("RGB", (300, 400), "white").save(first)
+    Image.new("RGB", (300, 400), "white").save(second)
+    draft = FocusPageDraft(
+        template_key="series a::6p-cycle",
+        series_label="Series A",
+        template_variant="6p-cycle",
+        page_ordinal=1,
+        sample_paths=(str(first), str(second)),
+        sample_labels=("Questionnaire 1", "Questionnaire 2"),
+    )
+    dialog = FocusReviewDialog([draft])
+
+    assert dialog.sample_combo.count() == 2
+    dialog.canvas.set_regions([[0.1, 0.2, 0.8, 0.9]])
+    dialog.sample_combo.setCurrentIndex(1)
+    regions = dialog.result_regions()
+
+    assert regions == {"series a::6p-cycle": {"1": [[0.1, 0.2, 0.8, 0.9]]}}
+    dialog.close()
     app.processEvents()

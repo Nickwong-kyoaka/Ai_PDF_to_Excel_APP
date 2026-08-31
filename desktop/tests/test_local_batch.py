@@ -6,7 +6,7 @@ from openpyxl import load_workbook
 from PIL import Image
 from sqlalchemy import select
 
-from backend.app.models import Answer, LocalBatch, LocalBatchItem, QuestionnaireGroup
+from backend.app.models import Answer, Job, LocalBatch, LocalBatchItem, QuestionnaireGroup
 from desktop.model_discovery import DetectedModel, DiscoveryResult
 from desktop.runner import LocalBatchRunner
 from desktop.runtime import create_runtime
@@ -220,6 +220,48 @@ def test_same_stem_inputs_receive_distinct_stable_output_names(tmp_path, monkeyp
             "survey_FormSight.xlsx",
             "survey_2_FormSight.xlsx",
         ]
+
+
+def test_focus_review_uses_first_two_questionnaires_and_persists_template_regions(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-data"))
+    runtime = create_runtime("http://127.0.0.1:1234")
+    source = tmp_path / "Series_questionnaire_001-002.pdf"
+    pages = [Image.new("RGB", (300, 420), "white") for _ in range(4)]
+    pages[0].save(source, save_all=True, append_images=pages[1:])
+
+    runner = LocalBatchRunner(runtime)
+    batch_id = runner.create_batch(
+        [source],
+        tmp_path / "outputs",
+        ready_discovery(),
+        review_groups=False,
+        review_focus=True,
+        series_labels=["Series Focus"],
+    )
+
+    assert runner.batch_status(batch_id)["status"] == "awaiting_focus"
+    drafts = runner.focus_drafts(batch_id)
+    assert [draft.page_ordinal for draft in drafts] == [1, 2]
+    assert all(len(draft.sample_paths) == 2 for draft in drafts)
+    template_key = drafts[0].template_key
+
+    runner.apply_focus_regions(
+        batch_id,
+        {template_key: {"1": [[0.1, 0.2, 0.8, 0.7]], "2": [[0.2, 0.1, 0.9, 0.9]]}},
+    )
+
+    assert runner.batch_status(batch_id)["status"] == "queued"
+    with runtime.sessions() as db:
+        batch = db.get(LocalBatch, batch_id)
+        item = db.scalar(select(LocalBatchItem).where(LocalBatchItem.batch_id == batch_id))
+        job = db.get(Job, item.job_id)
+        focus = job.profile_snapshot["focus_regions_v1"]
+        assert batch.review_focus is True
+        assert focus["source"] == "operator_first_two_questionnaires"
+        assert focus["region_count"] == 2
+        assert focus["regions_by_page"]["1"] == [[0.1, 0.2, 0.8, 0.7]]
 
 
 def test_disk_full_export_failure_resumes_without_reextracting(tmp_path, monkeypatch) -> None:

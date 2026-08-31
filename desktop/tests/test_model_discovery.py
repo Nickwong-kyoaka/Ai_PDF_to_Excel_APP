@@ -16,6 +16,11 @@ def pass_model_probe(monkeypatch):
         "probe_model_capability",
         lambda *_args, **_kwargs: (True, "vision + strict JSON passed"),
     )
+    monkeypatch.setattr(
+        model_discovery,
+        "probe_text_model_capability",
+        lambda *_args, **_kwargs: (True, "text + strict JSON passed"),
+    )
 
 
 def loaded_model(
@@ -188,6 +193,31 @@ def test_discovery_selects_gemma_verifier_and_reuses_primary_for_judging(monkeyp
     assert result.selected_vision.key == "qwen/qwen3-vl-8b"
     assert result.selected_verifier.key == "google/gemma-3-4b"
     assert result.selected_judge == result.selected_vision
+
+
+def test_discovery_prefers_separate_loaded_qwen_text_judge(monkeypatch) -> None:
+    monkeypatch.setattr(model_discovery, "discover_lmstudio_port", lambda: 5555)
+    monkeypatch.setattr(model_discovery, "loopback_binding_only", lambda _port: True)
+    payload = {
+        "models": [
+            loaded_model("qwen/qwen3-vl-8b", architecture="qwen3_vl"),
+            loaded_model("google/gemma-3-4b", architecture="gemma3", vision=True),
+            loaded_model("qwen/qwen3-8b", architecture="qwen3"),
+        ]
+    }
+    monkeypatch.setattr(
+        model_discovery.httpx,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200, raise_for_status=lambda: None, json=lambda: payload
+        ),
+    )
+
+    result = model_discovery.discover_models()
+
+    assert result.status == "ready"
+    assert result.selected_judge.key == "qwen/qwen3-8b"
+    assert result.probe_results["judge"] == "text + strict JSON passed"
 
 
 def test_manual_private_server_is_probed_without_local_binding_check(monkeypatch) -> None:

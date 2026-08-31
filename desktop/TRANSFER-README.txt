@@ -11,8 +11,10 @@ DESTINATION PC / 目標電腦
 
 2. Download and load these Q4 vision models in LM Studio (the verifier is recommended but optional):
    在 LM Studio 下載並載入以下 Q4 視覺模型（建議使用驗證模型，但不強制）：
-   - qwen/qwen3-vl-8b (primary extraction and final judge / 主要擷取及最終判斷)
+   - qwen/qwen3-vl-8b (primary extraction and fallback reasonableness judge / 主要擷取及後備合理性判斷)
    - google/gemma-3-4b (independent verifier / 獨立驗證)
+   - Optional: qwen/qwen3-8b text model (preferred flag-only reasonableness judge if VRAM/RAM permits /
+     可選：如顯示記憶體／記憶體許可，作為較佳的只標記合理性判斷模型)
 
 3. Recommended RTX 5060 Ti 16 GB settings for both models:
    RTX 5060 Ti 16 GB 建議兩個模型均使用：
@@ -46,6 +48,18 @@ DESTINATION PC / 目標電腦
    The app continues through grouping, scanning, checking, recovery, and Excel output without another click.
    選擇輸出資料夾，保留預設「全自動一次完成」及「平衡模式」，然後只按一次開始；
    程式會自動完成分組、掃描、合理性檢查、錯誤恢復及 Excel 輸出，中途毋須再按鍵。
+
+OPTIONAL FOCUS EXTRACTION / 可選重點提取
+
+- Choose "Auto-group, then circle focus areas" to inspect corresponding pages from questionnaire 1 and 2.
+  Draw one or more boxes around answer areas; those normalized boxes are reused for matching questionnaires
+  and matching PDFs in the same labelled series. Only the compact crop sheet is sent to the vision models.
+  選擇「自動分組，再從首兩份問卷圈選重點」即可比較第 1、2 份問卷的相同頁面；
+  圈選一個或多個答案區後，程式會套用至同標籤、同版式的其他問卷及 PDF，並只傳送重點裁切圖。
+- Switch between both samples before saving. Use Undo to remove the last box. "Use full page" clears
+  the current page's boxes; every unmarked page type automatically falls back to the full page.
+  儲存前可切換兩個樣本；「復原」會移除上一個框；「使用整頁」會清除該頁重點框。
+  所有未圈選頁面類型均會自動安全回退至整頁掃描。
 
 SPEED PROFILES / 速度模式
 

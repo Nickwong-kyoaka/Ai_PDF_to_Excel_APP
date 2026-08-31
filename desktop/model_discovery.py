@@ -158,6 +158,26 @@ def probe_model_capability(base_url: str, model_id: str, timeout: float = 30.0) 
     return True, "vision + strict JSON passed"
 
 
+def probe_text_model_capability(
+    base_url: str, model_id: str, timeout: float = 20.0
+) -> tuple[bool, str]:
+    """Verify a reasonableness model without requiring image support."""
+
+    gateway = LMStudioGateway(base_url, "", timeout=timeout)
+    try:
+        result = gateway.chat_json(
+            model=model_id,
+            prompt='Return exactly {"text_json":true,"value":"否"}. Do not translate the value.',
+            max_tokens=64,
+            retries=0,
+        )
+    except Exception as exc:
+        return False, str(exc)[:300]
+    if result.get("text_json") is not True or str(result.get("value") or "") != "否":
+        return False, f"text/schema test returned {result!r}"[:300]
+    return True, "text + strict JSON passed"
+
+
 def discover_lmstudio_port() -> int:
     executable = shutil.which("lms")
     if not executable:
@@ -379,6 +399,13 @@ def discover_models(timeout: float = 5.0, base_url: str | None = None) -> Discov
         )
     selected_vision = qwen_vision[0]
     selected_verifier = select_verifier_model(vision, selected_vision)
+    selected_judge = judges[0] if judges else selected_vision
+    judge_probe = "reusing primary Qwen vision model"
+    if selected_judge.api_id != selected_vision.api_id:
+        judge_passed, judge_probe = probe_text_model_capability(target, selected_judge.api_id)
+        if not judge_passed:
+            selected_judge = selected_vision
+            judge_probe = f"text model rejected; reusing primary ({judge_probe})"
     if not selected_verifier:
         passed, detail = probe_model_capability(target, selected_vision.api_id)
         if not passed:
@@ -389,8 +416,8 @@ def discover_models(timeout: float = 5.0, base_url: str | None = None) -> Discov
                 vision_models=vision,
                 judge_models=judges,
                 selected_vision=selected_vision,
-                selected_judge=selected_vision,
-                probe_results={"primary": detail},
+                selected_judge=selected_judge,
+                probe_results={"primary": detail, "judge": judge_probe},
                 message=f"The primary model failed the preflight image/JSON test: {detail}.",
             )
         return DiscoveryResult(
@@ -400,8 +427,8 @@ def discover_models(timeout: float = 5.0, base_url: str | None = None) -> Discov
             vision_models=vision,
             judge_models=judges,
             selected_vision=selected_vision,
-            selected_judge=selected_vision,
-            probe_results={"primary": detail},
+            selected_judge=selected_judge,
+            probe_results={"primary": detail, "judge": judge_probe},
             message=(
                 "Qwen-only mode passed preflight. For selective independent verification, load "
                 "a non-Qwen vision model such as google/gemma-3-4b Q4."
@@ -420,8 +447,8 @@ def discover_models(timeout: float = 5.0, base_url: str | None = None) -> Discov
                 judge_models=judges,
                 selected_vision=selected_vision,
                 selected_verifier=selected_verifier,
-                selected_judge=selected_vision,
-                probe_results=probe_results,
+                selected_judge=selected_judge,
+                probe_results={**probe_results, "judge": judge_probe},
                 message=(
                     f"The {role} model failed the preflight image/JSON test: {detail}. "
                     "Reload a vision-capable model before scanning."
@@ -435,7 +462,7 @@ def discover_models(timeout: float = 5.0, base_url: str | None = None) -> Discov
         judge_models=judges,
         selected_vision=selected_vision,
         selected_verifier=selected_verifier,
-        selected_judge=selected_vision,
-        probe_results=probe_results,
+        selected_judge=selected_judge,
+        probe_results={**probe_results, "judge": judge_probe},
         message="Sequential dual-model consensus passed the image/JSON preflight.",
     )

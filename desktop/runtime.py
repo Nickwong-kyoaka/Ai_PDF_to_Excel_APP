@@ -126,6 +126,11 @@ def create_runtime(base_url: str) -> DesktopRuntime:
                 "ALTER TABLE local_batches ADD COLUMN processing_mode VARCHAR(32) "
                 "NOT NULL DEFAULT 'balanced'"
             )
+        if "review_focus" not in batch_columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE local_batches ADD COLUMN review_focus BOOLEAN "
+                "NOT NULL DEFAULT 0"
+            )
         answer_columns = {
             str(row[1])
             for row in connection.exec_driver_sql("PRAGMA table_info(answers)").fetchall()
@@ -152,7 +157,7 @@ def create_runtime(base_url: str) -> DesktopRuntime:
                 "stage_message = 'Created by v0.5; restart with v0.6 grouping' "
                 "WHERE status NOT IN ('completed', 'failed', 'cancelled', 'legacy_requires_restart')"
             )
-    version_marker.write_text("0.6.0\n", encoding="utf-8")
+    version_marker.write_text("0.6.1\n", encoding="utf-8")
     sessions = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
     packaged_weights = resource_path("models/questionnaire_marks.onnx")
     user_weights = models / "questionnaire_marks.onnx"

@@ -27,7 +27,11 @@ from .group_series import (
     infer_safe_series_groups,
     page_cycle_similarity,
 )
-from .model_discovery import DiscoveryResult, probe_model_capability
+from .model_discovery import (
+    DiscoveryResult,
+    probe_model_capability,
+    probe_text_model_capability,
+)
 from .runtime import DesktopRuntime, ensure_local_identity
 
 
@@ -108,6 +112,16 @@ class GroupDraft:
 
 
 @dataclass(slots=True, frozen=True)
+class FocusPageDraft:
+    template_key: str
+    series_label: str
+    template_variant: str
+    page_ordinal: int
+    sample_paths: tuple[str, ...]
+    sample_labels: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class RunnerEvent:
     batch_id: str
     stage: str
@@ -129,6 +143,10 @@ def normalize_series_label(value: str) -> str:
     if not cleaned:
         raise ValueError("Every input needs a series label")
     return cleaned[:120]
+
+
+def focus_template_key(series_label: str, template_variant: str | None) -> str:
+    return f"{series_label.casefold()}::{(template_variant or 'generic').casefold()}"
 
 
 def series_workbook_filename(label: str) -> str:
@@ -170,6 +188,7 @@ class LocalBatchRunner:
         discovery: DiscoveryResult,
         *,
         review_groups: bool,
+        review_focus: bool = False,
         extractor_model_id: str | None = None,
         verifier_model_id: str | None = None,
         judge_model_id: str | None = None,
@@ -226,6 +245,18 @@ class LocalBatchRunner:
                     f"Selected {role} model failed the image/JSON preflight: {detail}"
                 )
         judge_id = judge_model_id or vision_id
+        if judge_id != vision_id:
+            judge_already_passed = (
+                discovery.selected_judge is not None
+                and discovery.selected_judge.api_id == judge_id
+                and "passed" in discovery.probe_results.get("judge", "").casefold()
+            )
+            if not judge_already_passed:
+                passed, detail = probe_text_model_capability(discovery.base_url, judge_id)
+                if not passed:
+                    raise ValueError(
+                        f"Selected reasonableness model failed the text/JSON preflight: {detail}"
+                    )
         output = Path(output_path).expanduser().resolve()
         if output.exists() and not output.is_dir():
             raise ValueError("The output location must be a folder")
@@ -280,6 +311,7 @@ class LocalBatchRunner:
                 status="preparing",
                 output_path=str(output),
                 review_groups=review_groups,
+                review_focus=review_focus,
                 processing_mode=processing_mode,
                 lmstudio_base_url=discovery.base_url,
                 extractor_model_id=vision_id,
@@ -484,7 +516,13 @@ class LocalBatchRunner:
                         stored_path=item.stored_path,
                         media_type=mimetypes.guess_type(item.stored_path)[0] or "application/octet-stream",
                         sha256=_sha256(Path(item.stored_path)),
-                        status="awaiting_confirmation" if batch.review_groups else "queued",
+                        status=(
+                            "awaiting_confirmation"
+                            if batch.review_groups
+                            else "awaiting_focus"
+                            if batch.review_focus
+                            else "queued"
+                        ),
                         page_count=info.page_count,
                         language="auto",
                         profile_snapshot=snapshot,
@@ -512,7 +550,13 @@ class LocalBatchRunner:
                             )
                         )
                     item.job_id = job.id
-                    item.status = "awaiting_confirmation" if batch.review_groups else "queued"
+                    item.status = (
+                        "awaiting_confirmation"
+                        if batch.review_groups
+                        else "awaiting_focus"
+                        if batch.review_focus
+                        else "queued"
+                    )
                     item.error = None
                 except Exception as exc:
                     item.status = "failed"
@@ -520,12 +564,19 @@ class LocalBatchRunner:
                     item.finished_at = utcnow()
                 db.commit()
 
-            batch.status = "awaiting_confirmation" if batch.review_groups else "queued"
-            batch.stage_message = (
-                "Review questionnaire page groups / 請檢查問卷頁面分組"
+            has_prepared_jobs = any(item.job_id for item in items)
+            batch.status = (
+                "awaiting_confirmation"
                 if batch.review_groups
-                else "Ready to scan / 準備掃描"
+                else "awaiting_focus"
+                if batch.review_focus and has_prepared_jobs
+                else "queued"
             )
+            batch.stage_message = {
+                "awaiting_confirmation": "Review questionnaire page groups / 請檢查問卷頁面分組",
+                "awaiting_focus": "Select reusable focus regions / 圈選可重用的重點區域",
+                "queued": "Ready to scan / 準備掃描",
+            }[batch.status]
             batch.progress = 0.12
             db.commit()
             self._emit(batch.id, batch.status, 0.12, batch.stage_message)
@@ -570,6 +621,131 @@ class LocalBatchRunner:
                     for group in groups
                 )
             return drafts
+
+    def focus_drafts(self, batch_id: str) -> list[FocusPageDraft]:
+        """Return each page type with samples from the first two questionnaires."""
+
+        with self.runtime.sessions() as db:
+            items = list(
+                db.scalars(
+                    select(LocalBatchItem)
+                    .where(LocalBatchItem.batch_id == batch_id, LocalBatchItem.job_id.is_not(None))
+                    .order_by(LocalBatchItem.order_index.asc())
+                ).all()
+            )
+            samples: dict[tuple[str, int], list[tuple[str, str]]] = {}
+            metadata: dict[str, tuple[str, str]] = {}
+            questionnaire_numbers: dict[str, int] = {}
+            for item in items:
+                job = db.get(Job, item.job_id) if item.job_id else None
+                if not job:
+                    continue
+                key = focus_template_key(item.series_label, item.template_variant)
+                metadata.setdefault(
+                    key, (item.series_label, item.template_variant or "generic")
+                )
+                groups = list(
+                    db.scalars(
+                        select(QuestionnaireGroup)
+                        .where(QuestionnaireGroup.job_id == job.id)
+                        .order_by(QuestionnaireGroup.group_index.asc())
+                    ).all()
+                )
+                root = self.runtime.settings.pages_dir / job.id
+                for group in groups:
+                    sample_number = questionnaire_numbers.get(key, 0) + 1
+                    if sample_number > 2:
+                        break
+                    questionnaire_numbers[key] = sample_number
+                    for page_number in range(group.start_page, group.end_page + 1):
+                        ordinal = page_number - group.start_page + 1
+                        image_path = root / f"page-{page_number:04d}.jpg"
+                        if not image_path.exists():
+                            continue
+                        samples.setdefault((key, ordinal), []).append(
+                            (
+                                str(image_path),
+                                f"Questionnaire {sample_number} · {Path(item.original_path).name} · page {page_number}",
+                            )
+                        )
+            drafts: list[FocusPageDraft] = []
+            for (key, ordinal), page_samples in sorted(
+                samples.items(),
+                key=lambda pair: (pair[0][0], pair[0][1]),
+            ):
+                series_label, template_variant = metadata[key]
+                drafts.append(
+                    FocusPageDraft(
+                        template_key=key,
+                        series_label=series_label,
+                        template_variant=template_variant,
+                        page_ordinal=ordinal,
+                        sample_paths=tuple(path for path, _label in page_samples[:2]),
+                        sample_labels=tuple(label for _path, label in page_samples[:2]),
+                    )
+                )
+            return drafts
+
+    def apply_focus_regions(
+        self,
+        batch_id: str,
+        regions_by_template: dict[str, dict[str, list[list[float]]]],
+    ) -> None:
+        """Validate and persist normalized focus boxes before any model calls begin."""
+
+        cleaned: dict[str, dict[str, list[list[float]]]] = {}
+        for template_key, page_map in regions_by_template.items():
+            if not isinstance(page_map, dict):
+                raise ValueError("Focus regions must be grouped by page type")
+            cleaned_pages: dict[str, list[list[float]]] = {}
+            for ordinal, regions in page_map.items():
+                if not str(ordinal).isdigit() or int(ordinal) < 1:
+                    raise ValueError("Focus page ordinals must be positive numbers")
+                cleaned_regions: list[list[float]] = []
+                for region in regions:
+                    if not isinstance(region, (list, tuple)) or len(region) != 4:
+                        raise ValueError("Every focus region must contain four coordinates")
+                    x1, y1, x2, y2 = (float(value) for value in region)
+                    if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
+                        raise ValueError("Focus coordinates must be normalized inside the page")
+                    if (x2 - x1) * (y2 - y1) < 0.0004:
+                        raise ValueError("A focus region is too small")
+                    cleaned_regions.append([x1, y1, x2, y2])
+                if cleaned_regions:
+                    cleaned_pages[str(int(ordinal))] = cleaned_regions
+            cleaned[str(template_key)] = cleaned_pages
+
+        with self.runtime.sessions() as db:
+            batch = db.get(LocalBatch, batch_id)
+            if not batch:
+                raise ValueError("Local batch not found")
+            items = list(
+                db.scalars(select(LocalBatchItem).where(LocalBatchItem.batch_id == batch.id)).all()
+            )
+            for item in items:
+                if not item.job_id:
+                    continue
+                job = db.get(Job, item.job_id)
+                if not job:
+                    continue
+                key = focus_template_key(item.series_label, item.template_variant)
+                page_regions = cleaned.get(key, {})
+                snapshot = dict(job.profile_snapshot or {})
+                snapshot["focus_regions_v1"] = {
+                    "version": 1,
+                    "template_key": key,
+                    "source": "operator_first_two_questionnaires",
+                    "regions_by_page": page_regions,
+                    "region_count": sum(len(values) for values in page_regions.values()),
+                }
+                job.profile_snapshot = snapshot
+                job.status = "queued"
+                job.stage_message = "Ready with reusable focus regions"
+                item.status = "queued"
+            batch.status = "queued"
+            batch.stage_message = "Focus regions saved — ready to scan / 重點區域已儲存，準備掃描"
+            batch.error = None
+            db.commit()
 
     def confirm_groups(self, batch_id: str, groups_by_job: dict[str, list[ProposedGroup]]) -> None:
         with self.runtime.sessions() as db:
@@ -627,6 +803,8 @@ class LocalBatchRunner:
                 raise ValueError("Local batch not found")
             if batch.status == "awaiting_confirmation":
                 raise ValueError("Confirm questionnaire page groups before scanning")
+            if batch.status == "awaiting_focus":
+                raise ValueError("Select or skip focus regions before scanning")
             items = list(
                 db.scalars(
                     select(LocalBatchItem)
@@ -778,6 +956,11 @@ class LocalBatchRunner:
                     ),
                     "verifier_calibration_offset": template_questionnaire_counts.get(
                         template_key, 0
+                    ),
+                    "focus_regions": (
+                        (dict(job.profile_snapshot or {}).get("focus_regions_v1") or {}).get(
+                            "regions_by_page", {}
+                        )
                     ),
                 }
                 extractor = QuestionnaireExtractor(
@@ -950,6 +1133,10 @@ class LocalBatchRunner:
             batch = db.get(LocalBatch, batch_id)
             if not batch:
                 raise ValueError("Local batch not found")
+            if batch.status == "awaiting_confirmation":
+                return "prepared", batch_id
+            if batch.status == "awaiting_focus":
+                return "focus", batch_id
             resume_preparation = batch.status == "preparing"
             items = list(db.scalars(select(LocalBatchItem).where(LocalBatchItem.batch_id == batch.id)).all())
             for item in items:
@@ -973,6 +1160,8 @@ class LocalBatchRunner:
                 batch = db.get(LocalBatch, batch_id)
                 if batch and batch.status == "awaiting_confirmation":
                     return "prepared", batch_id
+                if batch and batch.status == "awaiting_focus":
+                    return "focus", batch_id
         return self.execute_batch(batch_id)
 
     def latest_resumable_batch(self) -> str | None:
@@ -989,6 +1178,7 @@ class LocalBatchRunner:
                             "export_failed",
                             "queued",
                             "awaiting_confirmation",
+                            "awaiting_focus",
                         }
                     )
                 )
@@ -1019,6 +1209,7 @@ class LocalBatchRunner:
                 "verifier_model_id": batch.verifier_model_id,
                 "judge_model_id": batch.judge_model_id,
                 "processing_mode": batch.processing_mode,
+                "review_focus": batch.review_focus,
                 "items": [
                     {
                         "index": item.order_index,

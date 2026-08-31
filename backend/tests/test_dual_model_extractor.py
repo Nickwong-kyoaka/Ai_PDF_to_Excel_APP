@@ -5,6 +5,7 @@ from PIL import Image
 from app.config import Settings
 from app.scanner.extractor import (
     QuestionnaireExtractor,
+    build_focus_crop_sheet,
     chunk_judge_records,
     compact_answers_to_items,
 )
@@ -312,3 +313,48 @@ def test_missing_compact_answer_uses_one_targeted_crop_repair(tmp_path, monkeypa
     assert len(calls) == 2
     assert len(calls[1]["images"]) == 1
     assert debug["targeted_repair_used"] is True
+
+
+def test_operator_focus_sheet_excludes_unselected_page_content():
+    image = Image.new("RGB", (1000, 800), "blue")
+    for x in range(400):
+        for y in range(320):
+            image.putpixel((x, y), (220, 20, 20))
+
+    focused = build_focus_crop_sheet(image, [[0.0, 0.0, 0.4, 0.4]])
+
+    assert focused.width < image.width
+    assert focused.height < image.height
+    red_pixels = sum(
+        1 for red, green, blue in focused.getdata() if red > 150 and green < 80 and blue < 80
+    )
+    assert red_pixels / (focused.width * focused.height) > 0.85
+
+
+def test_operator_focus_regions_are_used_for_every_model_pass(tmp_path, monkeypatch):
+    extractor = make_extractor(tmp_path)
+    extractor.profile.update(
+        {
+            "focus_regions": {"1": [[0.1, 0.2, 0.5, 0.6]]},
+            "verification_mode": "maximum",
+        }
+    )
+    monkeypatch.setattr(
+        "app.scanner.extractor.render_page",
+        lambda *args, **kwargs: Image.new("RGB", (1000, 800), "white"),
+    )
+    observed_sizes: list[tuple[int, int]] = []
+
+    def fake_pass(image, page_number, total_pages, pass_name, include_tiles, model_id=None):
+        observed_sizes.append(image.size)
+        return [extracted_item()]
+
+    extractor.extract_pass = fake_pass
+    _answers, debug = extractor.extract_one_page(
+        Path("survey.pdf"), 1, 1, False, page_ordinal=1
+    )
+
+    assert observed_sizes == [(424, 339), (424, 339)]
+    assert debug["focus_regions_applied"] == [[0.1, 0.2, 0.5, 0.6]]
+    assert debug["focus_original_size"] == [1000, 800]
+    assert debug["focus_model_image_size"] == [424, 339]

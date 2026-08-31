@@ -6,8 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QThread, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QPixmap
+from PySide6.QtCore import QPointF, QRectF, QThread, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -47,6 +47,7 @@ from .model_discovery import (
 )
 from .runner import (
     ALLOWED_SUFFIXES,
+    FocusPageDraft,
     GroupDraft,
     LocalBatchRunner,
     RunnerEvent,
@@ -82,12 +83,14 @@ TEXT = {
         "browse": "Browse…",
         "run_mode": "Run mode",
         "auto_one_take": "Automatic one-take — no pauses (recommended)",
+        "focus_first_two": "Auto-group, then circle focus areas on the first two questionnaires",
         "review_first": "Review page groups before scanning",
         "performance": "Processing profile",
         "balanced": "Balanced — selective verifier (recommended)",
         "maximum": "Higher accuracy — larger images + 20% audit",
-        "vision": "Primary vision model + judge",
-        "judge": "Independent non-Qwen verifier",
+        "vision": "Primary Qwen vision extractor",
+        "judge": "Independent non-Qwen vision verifier",
+        "reason": "Qwen reasonableness checker (flag-only)",
         "start": "Start Scan",
         "cancel": "Cancel",
         "resume": "Resume Last Batch",
@@ -140,12 +143,14 @@ TEXT = {
         "browse": "瀏覽…",
         "run_mode": "執行模式",
         "auto_one_take": "全自動一次完成 — 中途不停頓（建議）",
+        "focus_first_two": "自動分組，再從首兩份問卷圈選重點提取區域",
         "review_first": "掃描前檢查頁面分組",
         "performance": "處理模式",
         "balanced": "平衡模式 — 只驗證可疑頁面（建議）",
         "maximum": "較高準確度 — 較大圖像及 20% 抽查",
-        "vision": "主要視覺模型兼合理性判斷",
-        "judge": "獨立非 Qwen 驗證模型",
+        "vision": "主要 Qwen 視覺提取模型",
+        "judge": "獨立非 Qwen 視覺驗證模型",
+        "reason": "Qwen 合理性檢查模型（只標記）",
         "start": "開始掃描",
         "cancel": "取消",
         "resume": "恢復上次批次",
@@ -190,6 +195,7 @@ class DiscoveryThread(QThread):
 class BatchThread(QThread):
     event = Signal(object)
     prepared = Signal(str, object)
+    focus_prepared = Signal(str, object)
     succeeded = Signal(object)
     failed = Signal(str)
 
@@ -204,6 +210,9 @@ class BatchThread(QThread):
             if isinstance(value, tuple) and len(value) == 2 and value[0] == "prepared":
                 batch_id = str(value[1])
                 self.prepared.emit(batch_id, self.runner.group_drafts(batch_id))
+            elif isinstance(value, tuple) and len(value) == 2 and value[0] == "focus":
+                batch_id = str(value[1])
+                self.focus_prepared.emit(batch_id, self.runner.focus_drafts(batch_id))
             else:
                 self.succeeded.emit(value)
         except Exception as exc:
@@ -212,6 +221,269 @@ class BatchThread(QThread):
 
     def cancel(self) -> None:
         self.runner.request_cancel()
+
+
+class FocusCanvas(QWidget):
+    """Image canvas that stores reusable focus rectangles as normalized coordinates."""
+
+    regions_changed = Signal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._pixmap = QPixmap()
+        self._regions: list[list[float]] = []
+        self._drag_start: QPointF | None = None
+        self._drag_current: QPointF | None = None
+        self.setMinimumSize(720, 470)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def load_image(self, path: str | Path | None) -> None:
+        self._pixmap = QPixmap(str(path)) if path else QPixmap()
+        self._drag_start = None
+        self._drag_current = None
+        self.update()
+
+    def set_regions(self, regions: list[list[float]]) -> None:
+        self._regions = [list(region) for region in regions]
+        self.update()
+
+    def regions(self) -> list[list[float]]:
+        return [list(region) for region in self._regions]
+
+    def undo(self) -> None:
+        if self._regions:
+            self._regions.pop()
+            self.regions_changed.emit()
+            self.update()
+
+    def clear_regions(self) -> None:
+        if self._regions:
+            self._regions.clear()
+            self.regions_changed.emit()
+            self.update()
+
+    def _image_rect(self) -> QRectF:
+        if self._pixmap.isNull() or self.width() <= 0 or self.height() <= 0:
+            return QRectF()
+        scale = min(self.width() / self._pixmap.width(), self.height() / self._pixmap.height())
+        width = self._pixmap.width() * scale
+        height = self._pixmap.height() * scale
+        return QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
+
+    def _normalized_point(self, point: QPointF) -> QPointF:
+        image_rect = self._image_rect()
+        if image_rect.isEmpty():
+            return QPointF()
+        return QPointF(
+            max(0.0, min(1.0, (point.x() - image_rect.left()) / image_rect.width())),
+            max(0.0, min(1.0, (point.y() - image_rect.top()) / image_rect.height())),
+        )
+
+    def paintEvent(self, _event) -> None:  # type: ignore[no-untyped-def]
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#dfe7e4"))
+        target = self._image_rect()
+        if self._pixmap.isNull() or target.isEmpty():
+            painter.setPen(QColor("#61756f"))
+            painter.drawText(
+                self.rect(), Qt.AlignmentFlag.AlignCenter, "Preview unavailable / 無法顯示預覽"
+            )
+            return
+        painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
+        pen = QPen(QColor("#e84b3c"), 3)
+        painter.setPen(pen)
+        for index, (x1, y1, x2, y2) in enumerate(self._regions, start=1):
+            box = QRectF(
+                target.left() + x1 * target.width(),
+                target.top() + y1 * target.height(),
+                (x2 - x1) * target.width(),
+                (y2 - y1) * target.height(),
+            )
+            painter.drawRect(box)
+            painter.fillRect(QRectF(box.left(), box.top(), 28, 22), QColor(232, 75, 60, 210))
+            painter.setPen(QColor("white"))
+            painter.drawText(
+                QRectF(box.left(), box.top(), 28, 22), Qt.AlignmentFlag.AlignCenter, str(index)
+            )
+            painter.setPen(pen)
+        if self._drag_start is not None and self._drag_current is not None:
+            painter.setPen(QPen(QColor("#ff8b3d"), 2, Qt.PenStyle.DashLine))
+            painter.drawRect(QRectF(self._drag_start, self._drag_current).normalized())
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._image_rect().contains(event.position()):
+            self._drag_start = event.position()
+            self._drag_current = event.position()
+            self.update()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_start is not None:
+            target = self._image_rect()
+            self._drag_current = QPointF(
+                max(target.left(), min(target.right(), event.position().x())),
+                max(target.top(), min(target.bottom(), event.position().y())),
+            )
+            self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or self._drag_start is None:
+            return
+        self._drag_current = self._drag_current or event.position()
+        start = self._normalized_point(self._drag_start)
+        end = self._normalized_point(self._drag_current)
+        x1, x2 = sorted((start.x(), end.x()))
+        y1, y2 = sorted((start.y(), end.y()))
+        if (x2 - x1) * (y2 - y1) >= 0.0004:
+            self._regions.append([x1, y1, x2, y2])
+            self.regions_changed.emit()
+        self._drag_start = None
+        self._drag_current = None
+        self.update()
+
+
+class FocusReviewDialog(QDialog):
+    def __init__(self, drafts: list[FocusPageDraft], parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Focus extraction / 重點提取")
+        self.resize(1180, 820)
+        self._drafts = drafts
+        self._active_index = -1
+        self._regions: dict[str, dict[str, list[list[float]]]] = defaultdict(dict)
+
+        layout = QVBoxLayout(self)
+        title = QLabel("Circle the parts AI should read / 圈選 AI 需要提取的部分")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+        note = QLabel(
+            "For each page type, inspect questionnaire 1 and 2 and draw one or more boxes. "
+            "The same boxes are reused for all matching questionnaires and PDFs. Pages without boxes use the full page.\n"
+            "請檢查首兩份問卷的相同頁面，拖曳圈選一個或多個重點區域；程式會套用至同系列及版式。未圈選的頁面會安全地使用整頁。"
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        nav = QFrame()
+        nav.setObjectName("panel")
+        nav_layout = QHBoxLayout(nav)
+        self.previous_button = QPushButton("‹ Previous page type / 上一頁類型")
+        self.page_combo = QComboBox()
+        self.next_button = QPushButton("Next page type / 下一頁類型 ›")
+        for draft in drafts:
+            self.page_combo.addItem(
+                f"{draft.series_label} · {draft.template_variant} · page {draft.page_ordinal}",
+                self.page_combo.count(),
+            )
+        nav_layout.addWidget(self.previous_button)
+        nav_layout.addWidget(self.page_combo, 1)
+        nav_layout.addWidget(self.next_button)
+        layout.addWidget(nav)
+
+        sample_row = QHBoxLayout()
+        sample_row.addWidget(QLabel("Compare sample / 比較樣本:"))
+        self.sample_combo = QComboBox()
+        sample_row.addWidget(self.sample_combo, 1)
+        self.region_status = QLabel()
+        self.region_status.setObjectName("seriesSummary")
+        sample_row.addWidget(self.region_status)
+        layout.addLayout(sample_row)
+
+        self.canvas = FocusCanvas()
+        layout.addWidget(self.canvas, 1)
+
+        controls = QHBoxLayout()
+        self.undo_button = QPushButton("Undo last box / 復原上一個框")
+        self.clear_button = QPushButton("Use full page / 使用整頁")
+        controls.addWidget(self.undo_button)
+        controls.addWidget(self.clear_button)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Save focus & scan / 儲存重點並掃描"
+        )
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.page_combo.currentIndexChanged.connect(self._switch_page)
+        self.sample_combo.currentIndexChanged.connect(self._switch_sample)
+        self.previous_button.clicked.connect(
+            lambda: self.page_combo.setCurrentIndex(max(0, self.page_combo.currentIndex() - 1))
+        )
+        self.next_button.clicked.connect(
+            lambda: self.page_combo.setCurrentIndex(
+                min(self.page_combo.count() - 1, self.page_combo.currentIndex() + 1)
+            )
+        )
+        self.undo_button.clicked.connect(self.canvas.undo)
+        self.clear_button.clicked.connect(self.canvas.clear_regions)
+        self.canvas.regions_changed.connect(self._update_status)
+        if drafts:
+            self._switch_page(0)
+
+    def _capture(self) -> None:
+        if not (0 <= self._active_index < len(self._drafts)):
+            return
+        draft = self._drafts[self._active_index]
+        page_key = str(draft.page_ordinal)
+        regions = self.canvas.regions()
+        if regions:
+            self._regions[draft.template_key][page_key] = regions
+        else:
+            self._regions[draft.template_key].pop(page_key, None)
+
+    def _switch_page(self, index: int) -> None:
+        self._capture()
+        if not (0 <= index < len(self._drafts)):
+            return
+        self._active_index = index
+        draft = self._drafts[index]
+        self.sample_combo.blockSignals(True)
+        self.sample_combo.clear()
+        for sample_index, label in enumerate(draft.sample_labels):
+            self.sample_combo.addItem(label, sample_index)
+        self.sample_combo.blockSignals(False)
+        self.canvas.set_regions(
+            self._regions[draft.template_key].get(str(draft.page_ordinal), [])
+        )
+        self.sample_combo.setCurrentIndex(0)
+        self.canvas.load_image(draft.sample_paths[0] if draft.sample_paths else None)
+        self.previous_button.setEnabled(index > 0)
+        self.next_button.setEnabled(index + 1 < len(self._drafts))
+        self._update_status()
+
+    def _switch_sample(self, index: int) -> None:
+        if not (0 <= self._active_index < len(self._drafts)):
+            return
+        draft = self._drafts[self._active_index]
+        if 0 <= index < len(draft.sample_paths):
+            self.canvas.load_image(draft.sample_paths[index])
+
+    def _update_status(self) -> None:
+        count = len(self.canvas.regions())
+        self.region_status.setText(
+            f"{count} focus box(es) / {count} 個重點框"
+            if count
+            else "Full-page fallback / 使用整頁"
+        )
+
+    def result_regions(self) -> dict[str, dict[str, list[list[float]]]]:
+        self._capture()
+        return {
+            key: {
+                page: [list(region) for region in regions]
+                for page, regions in pages.items()
+            }
+            for key, pages in self._regions.items()
+        }
+
+    def _accept(self) -> None:
+        self._capture()
+        self.accept()
 
 
 class GroupReviewDialog(QDialog):
@@ -705,11 +977,14 @@ class MainWindow(QMainWindow):
             self.server_combo.addItem(server, server)
         self.vision_label = QLabel()
         self.judge_label = QLabel()
+        self.reason_label = QLabel()
         self.vision_combo = QComboBox()
         self.judge_combo = QComboBox()
+        self.reason_combo = QComboBox()
         model_form.addRow(self.server_label, self.server_combo)
         model_form.addRow(self.vision_label, self.vision_combo)
         model_form.addRow(self.judge_label, self.judge_combo)
+        model_form.addRow(self.reason_label, self.reason_combo)
         outer.addWidget(model_frame)
 
         file_header = QHBoxLayout()
@@ -900,6 +1175,7 @@ class MainWindow(QMainWindow):
         self.refresh_button.setText(self.tr("refresh"))
         self.vision_label.setText(self.tr("vision"))
         self.judge_label.setText(self.tr("judge"))
+        self.reason_label.setText(self.tr("reason"))
         self.files_label.setText(self.tr("files"))
         self.add_files_button.setText(self.tr("add_files"))
         self.add_folder_button.setText(self.tr("add_folder"))
@@ -915,6 +1191,7 @@ class MainWindow(QMainWindow):
         run_mode = self.run_mode_combo.currentData() or "automatic"
         self.run_mode_combo.clear()
         self.run_mode_combo.addItem(self.tr("auto_one_take"), "automatic")
+        self.run_mode_combo.addItem(self.tr("focus_first_two"), "focus")
         self.run_mode_combo.addItem(self.tr("review_first"), "review")
         run_index = self.run_mode_combo.findData(run_mode)
         self.run_mode_combo.setCurrentIndex(max(0, run_index))
@@ -972,6 +1249,7 @@ class MainWindow(QMainWindow):
             self.lm_status.setText(f"● {self.tr('not_ready')} — {result.message}")
         self.vision_combo.clear()
         self.judge_combo.clear()
+        self.reason_combo.clear()
         primary_options = [
             model
             for model in result.vision_models
@@ -988,6 +1266,13 @@ class MainWindow(QMainWindow):
         for model in verifier_options:
             self.judge_combo.addItem(f"{model.display_name} [{model.api_id}]", model.api_id)
         if result.selected_vision:
+            self.reason_combo.addItem(
+                f"Reuse primary: {result.selected_vision.display_name} / 重用主要模型",
+                result.selected_vision.api_id,
+            )
+        for model in result.judge_models:
+            self.reason_combo.addItem(f"{model.display_name} [{model.api_id}]", model.api_id)
+        if result.selected_vision:
             index = self.vision_combo.findData(result.selected_vision.api_id)
             if index >= 0:
                 self.vision_combo.setCurrentIndex(index)
@@ -995,6 +1280,10 @@ class MainWindow(QMainWindow):
             index = self.judge_combo.findData(result.selected_verifier.api_id)
             if index >= 0:
                 self.judge_combo.setCurrentIndex(index)
+        if result.selected_judge:
+            index = self.reason_combo.findData(result.selected_judge.api_id)
+            if index >= 0:
+                self.reason_combo.setCurrentIndex(index)
         self.yolo_status.setStyleSheet(
             f"color: {'#117d65' if ready else '#a86b00'}; font-weight: 600;"
         )
@@ -1250,10 +1539,13 @@ class MainWindow(QMainWindow):
         self.output_ready = None
         self.open_button.setEnabled(False)
         sources = list(self.paths)
-        review = self.run_mode_combo.currentData() == "review"
+        selected_run_mode = str(self.run_mode_combo.currentData() or "automatic")
+        review = selected_run_mode == "review"
+        focus = selected_run_mode == "focus"
         processing_mode = str(self.performance_combo.currentData() or "balanced")
         vision_id = str(self.vision_combo.currentData())
         verifier_id = str(self.judge_combo.currentData() or "")
+        reason_id = str(self.reason_combo.currentData() or vision_id)
         discovery = self.discovery
 
         def prepare(runner: LocalBatchRunner):
@@ -1262,14 +1554,17 @@ class MainWindow(QMainWindow):
                 output,
                 discovery,
                 review_groups=review,
+                review_focus=focus,
                 extractor_model_id=vision_id,
                 verifier_model_id=verifier_id,
-                judge_model_id=vision_id,
+                judge_model_id=reason_id,
                 series_labels=list(self.series_labels),
                 processing_mode=processing_mode,
             )
             if review:
                 return "prepared", batch_id
+            if focus and runner.batch_status(batch_id)["status"] == "awaiting_focus":
+                return "focus", batch_id
             return runner.execute_batch(batch_id)
 
         self._run_thread(prepare, preparing=True)
@@ -1281,6 +1576,7 @@ class MainWindow(QMainWindow):
         self.batch_thread = BatchThread(operation, self.runtime)
         self.batch_thread.event.connect(self._handle_event)
         self.batch_thread.prepared.connect(self._handle_prepared)
+        self.batch_thread.focus_prepared.connect(self._handle_focus_prepared)
         self.batch_thread.succeeded.connect(self._handle_success)
         self.batch_thread.failed.connect(self._handle_failure)
         self.batch_thread.start()
@@ -1300,6 +1596,28 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Group confirmation failed", str(exc))
             return
+        self._run_thread(lambda runner: runner.execute_batch(batch_id))
+
+    def _handle_focus_prepared(self, batch_id: str, drafts: list[FocusPageDraft]) -> None:
+        self.current_batch_id = batch_id
+        self._set_busy(False)
+        if not drafts:
+            self._log("No reusable page samples were available; continuing with full pages.")
+            assert self.runtime
+            LocalBatchRunner(self.runtime).apply_focus_regions(batch_id, {})
+            self._run_thread(lambda runner: runner.execute_batch(batch_id))
+            return
+        dialog = FocusReviewDialog(drafts, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._log("Focus selection cancelled. The prepared batch can be resumed later.")
+            return
+        assert self.runtime
+        try:
+            LocalBatchRunner(self.runtime).apply_focus_regions(batch_id, dialog.result_regions())
+        except Exception as exc:
+            QMessageBox.critical(self, "Focus selection failed", str(exc))
+            return
+        self._log("Reusable focus regions saved; only selected content will be sent to the models.")
         self._run_thread(lambda runner: runner.execute_batch(batch_id))
 
     def _handle_event(self, event: RunnerEvent) -> None:
@@ -1362,6 +1680,10 @@ class MainWindow(QMainWindow):
             drafts = LocalBatchRunner(self.runtime).group_drafts(batch_id)
             self._handle_prepared(batch_id, drafts)
             return
+        if status["status"] == "awaiting_focus":
+            drafts = LocalBatchRunner(self.runtime).focus_drafts(batch_id)
+            self._handle_focus_prepared(batch_id, drafts)
+            return
         self._run_thread(lambda runner: runner.resume_batch(batch_id))
 
     def _update_rows_from_batch(self) -> None:
@@ -1407,6 +1729,7 @@ class MainWindow(QMainWindow):
             self.performance_combo,
             self.vision_combo,
             self.judge_combo,
+            self.reason_combo,
             self.refresh_button,
             self.resume_button,
         ):

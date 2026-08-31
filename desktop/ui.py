@@ -12,6 +12,7 @@ from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -42,6 +43,7 @@ from .group_series import build_fixed_size_series, clone_page_pattern, numbered_
 from .model_discovery import (
     DiscoveryResult,
     discover_models,
+    is_routable_server_address,
     load_recent_servers,
     remember_server,
 )
@@ -69,6 +71,7 @@ TEXT = {
         "lm": "LM Studio",
         "server": "LM Studio server",
         "server_auto": "Auto-detect on this PC",
+        "allow_public_server": "Advanced: allow an explicit public/routable server IP",
         "yolo": "Sequential consensus",
         "refresh": "Refresh detection",
         "add_files": "Add Files",
@@ -129,6 +132,7 @@ TEXT = {
         "lm": "LM Studio",
         "server": "LM Studio 伺服器",
         "server_auto": "自動偵測此電腦",
+        "allow_public_server": "進階：允許明確輸入的公共／可路由伺服器 IP",
         "yolo": "順序式雙模型共識",
         "refresh": "重新偵測",
         "add_files": "加入檔案",
@@ -184,12 +188,20 @@ TEXT = {
 class DiscoveryThread(QThread):
     result_ready = Signal(object)
 
-    def __init__(self, base_url: str | None = None, parent: QWidget | None = None):
+    def __init__(
+        self,
+        base_url: str | None = None,
+        allow_public: bool = False,
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
         self.base_url = base_url
+        self.allow_public = allow_public
 
     def run(self) -> None:
-        self.result_ready.emit(discover_models(base_url=self.base_url))
+        self.result_ready.emit(
+            discover_models(base_url=self.base_url, allow_public=self.allow_public)
+        )
 
 
 class BatchThread(QThread):
@@ -913,6 +925,8 @@ class MainWindow(QMainWindow):
         self._refreshing_files = False
         self._resume_prompted = False
         self._active_discovery_target: str | None = None
+        self._active_discovery_allow_public = False
+        self._approved_routable_servers: set[str] = set()
         self.setMinimumSize(1180, 800)
         self.setAcceptDrops(True)
         self._build_ui()
@@ -975,6 +989,7 @@ class MainWindow(QMainWindow):
         self.server_combo.addItem("", "")
         for server in load_recent_servers():
             self.server_combo.addItem(server, server)
+        self.allow_public_server = QCheckBox()
         self.vision_label = QLabel()
         self.judge_label = QLabel()
         self.reason_label = QLabel()
@@ -982,6 +997,7 @@ class MainWindow(QMainWindow):
         self.judge_combo = QComboBox()
         self.reason_combo = QComboBox()
         model_form.addRow(self.server_label, self.server_combo)
+        model_form.addRow("", self.allow_public_server)
         model_form.addRow(self.vision_label, self.vision_combo)
         model_form.addRow(self.judge_label, self.judge_combo)
         model_form.addRow(self.reason_label, self.reason_combo)
@@ -1169,7 +1185,12 @@ class MainWindow(QMainWindow):
         if self.server_combo.count():
             self.server_combo.setItemText(0, self.tr("server_auto"))
         self.server_combo.setToolTip(
-            "Auto, 127.0.0.1:1234, or a private LAN/VPN address such as 192.168.1.50:1234"
+            "Auto, 127.0.0.1:1234, a private LAN/VPN address, or an explicitly approved routable IP"
+        )
+        self.allow_public_server.setText(self.tr("allow_public_server"))
+        self.allow_public_server.setToolTip(
+            "Use only when the remote LM Studio firewall permits this PC/VPN. "
+            "Plain HTTP sends questionnaire images without transport encryption."
         )
         self.yolo_title.setText(self.tr("yolo"))
         self.refresh_button.setText(self.tr("refresh"))
@@ -1229,7 +1250,32 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.lm_status.setText("Checking LM Studio… / 正在偵測 LM Studio…")
         self._active_discovery_target = self._selected_server_target()
-        self.discovery_thread = DiscoveryThread(self._active_discovery_target, self)
+        self._active_discovery_allow_public = self.allow_public_server.isChecked()
+        if (
+            self._active_discovery_target
+            and is_routable_server_address(self._active_discovery_target)
+            and self._active_discovery_allow_public
+            and self._active_discovery_target not in self._approved_routable_servers
+        ):
+            answer = QMessageBox.question(
+                self,
+                "Routable LM Studio server / 可路由 LM Studio 伺服器",
+                "This address is publicly routable. Questionnaire images may leave the private LAN, "
+                "and plain HTTP is not encrypted. Continue only when the server firewall allows this "
+                "PC/VPN and you trust the network.\n\n"
+                "此位址可由公共網絡路由。問卷圖像可能離開私人內聯網，而且 HTTP 不會加密。"
+                "只應在伺服器防火牆僅允許本電腦／VPN 且網絡可信時繼續。\n\nContinue / 繼續？",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.refresh_button.setEnabled(True)
+                self.lm_status.setText("Remote server cancelled / 已取消遠端伺服器")
+                return
+            self._approved_routable_servers.add(self._active_discovery_target)
+        self.discovery_thread = DiscoveryThread(
+            self._active_discovery_target,
+            self._active_discovery_allow_public,
+            self,
+        )
         self.discovery_thread.result_ready.connect(self._show_discovery)
         self.discovery_thread.finished.connect(lambda: self.refresh_button.setEnabled(True))
         self.discovery_thread.start()
@@ -1305,7 +1351,14 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(ready and bool(self.paths) and not self._busy())
         if ready and self._active_discovery_target:
             try:
-                remember_server(result.base_url)
+                remember_server(
+                    result.base_url,
+                    allow_public=self._active_discovery_allow_public,
+                )
+                if self._active_discovery_allow_public and is_routable_server_address(
+                    result.base_url
+                ):
+                    self._approved_routable_servers.add(result.base_url)
                 if self.server_combo.findData(result.base_url) < 0:
                     self.server_combo.addItem(result.base_url, result.base_url)
                 self.server_combo.setCurrentText(result.base_url)
@@ -1725,6 +1778,7 @@ class MainWindow(QMainWindow):
             self.file_table,
             self.output_browse_button,
             self.server_combo,
+            self.allow_public_server,
             self.run_mode_combo,
             self.performance_combo,
             self.vision_combo,

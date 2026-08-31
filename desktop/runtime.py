@@ -157,7 +157,7 @@ def create_runtime(base_url: str) -> DesktopRuntime:
                 "stage_message = 'Created by v0.5; restart with v0.6 grouping' "
                 "WHERE status NOT IN ('completed', 'failed', 'cancelled', 'legacy_requires_restart')"
             )
-    version_marker.write_text("0.6.1\n", encoding="utf-8")
+    version_marker.write_text("0.6.2\n", encoding="utf-8")
     sessions = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
     packaged_weights = resource_path("models/questionnaire_marks.onnx")
     user_weights = models / "questionnaire_marks.onnx"

@@ -44,8 +44,8 @@ def _allowed_private_host(host: str) -> bool:
     )
 
 
-def normalize_server_address(value: str) -> str:
-    """Normalize a local/private-LAN LM Studio endpoint and reject public targets."""
+def normalize_server_address(value: str, *, allow_public: bool = False) -> str:
+    """Normalize an LM Studio endpoint; routable IPs require explicit opt-in."""
 
     raw = str(value or "").strip()
     if not raw:
@@ -58,8 +58,18 @@ def normalize_server_address(value: str) -> str:
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError("Credentials, query strings, and fragments are not allowed in the server address")
     host = parsed.hostname or ""
-    if not host or not _allowed_private_host(host):
-        raise ValueError("Use only localhost, a private LAN/VPN IP, or a local computer name")
+    if not host:
+        raise ValueError("Enter an LM Studio server host")
+    if not _allowed_private_host(host):
+        try:
+            public_ip = ipaddress.ip_address(host)
+        except ValueError:
+            public_ip = None
+        if not allow_public or public_ip is None:
+            raise ValueError(
+                "This is a public/routable address. Enable the advanced public-server option "
+                "only when its firewall is restricted to this PC or VPN."
+            )
     try:
         port = parsed.port or (443 if parsed.scheme == "https" else 1234)
     except ValueError as exc:
@@ -73,6 +83,24 @@ def normalize_server_address(value: str) -> str:
     return f"{parsed.scheme}://{rendered_host}:{port}"
 
 
+def is_routable_server_address(value: str) -> bool:
+    """Return True only for explicit globally routable IP addresses."""
+
+    try:
+        normalized = normalize_server_address(value, allow_public=True)
+        host = urlsplit(normalized).hostname or ""
+        address = ipaddress.ip_address(host)
+    except (ValueError, TypeError):
+        return False
+    shared_v4 = ipaddress.ip_network("100.64.0.0/10")
+    return not bool(
+        address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or (isinstance(address, ipaddress.IPv4Address) and address in shared_v4)
+    )
+
+
 def load_recent_servers() -> list[str]:
     try:
         payload = json.loads(_history_path().read_text(encoding="utf-8"))
@@ -83,7 +111,7 @@ def load_recent_servers() -> list[str]:
     recent: list[str] = []
     for value in payload:
         try:
-            normalized = normalize_server_address(str(value))
+            normalized = normalize_server_address(str(value), allow_public=True)
         except ValueError:
             continue
         if normalized not in recent:
@@ -91,8 +119,8 @@ def load_recent_servers() -> list[str]:
     return recent[:RECENT_SERVER_LIMIT]
 
 
-def remember_server(value: str) -> None:
-    normalized = normalize_server_address(value)
+def remember_server(value: str, *, allow_public: bool = False) -> None:
+    normalized = normalize_server_address(value, allow_public=allow_public)
     recent = [normalized, *[item for item in load_recent_servers() if item != normalized]]
     path = _history_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,11 +366,16 @@ def loopback_binding_only(port: int) -> bool | None:
     return True if found else None
 
 
-def discover_models(timeout: float = 5.0, base_url: str | None = None) -> DiscoveryResult:
+def discover_models(
+    timeout: float = 5.0,
+    base_url: str | None = None,
+    *,
+    allow_public: bool = False,
+) -> DiscoveryResult:
     manual_target = bool(base_url and base_url.strip())
     if manual_target:
         try:
-            target = normalize_server_address(str(base_url))
+            target = normalize_server_address(str(base_url), allow_public=allow_public)
         except ValueError as exc:
             return DiscoveryResult("invalid_server", str(base_url), 0, message=str(exc))
         parsed = urlsplit(target)

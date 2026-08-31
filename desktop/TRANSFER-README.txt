@@ -42,6 +42,14 @@ DESTINATION PC / 目標電腦
    啟動 FormSight 本機版。可保留自動偵測，或輸入指定私人伺服器位址（例如
    192.168.1.50:1234 或 gpu-pc:1234），再按重新偵測並確認綠色狀態顯示正確模型。
 
+   For an explicitly trusted routable address such as 158.132.152.60, enter
+   http://158.132.152.60:1234, enable the Advanced public/routable server option, click Refresh,
+   and accept the warning. Use the server's actual port if it is not 1234. Restrict its firewall
+   to this PC/VPN; plain HTTP does not encrypt questionnaire images.
+   如需使用明確信任的可路由位址（例如 158.132.152.60），請輸入
+   http://158.132.152.60:1234、啟用進階公共／可路由伺服器選項、按重新偵測並接受警告。
+   如非 1234 埠請輸入實際埠號；防火牆應只允許本電腦／VPN，HTTP 不會加密問卷圖像。
+
 7. Select related file rows and click Set Series Label. Every PDF with the same label is combined
    into one Excel workbook, even when one PDF contains one questionnaire and another contains many.
    選取相關檔案列並按「設定系列標籤」。所有相同標籤的 PDF 會合併至同一 Excel；

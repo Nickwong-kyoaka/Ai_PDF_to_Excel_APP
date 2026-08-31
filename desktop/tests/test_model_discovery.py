@@ -88,6 +88,12 @@ def test_manual_server_address_is_normalized_and_public_targets_are_rejected() -
         else:
             raise AssertionError(f"Public/unsupported target was accepted: {value}")
 
+    assert model_discovery.normalize_server_address(
+        "http://158.132.152.60", allow_public=True
+    ) == "http://158.132.152.60:1234"
+    assert model_discovery.is_routable_server_address("158.132.152.60") is True
+    assert model_discovery.is_routable_server_address("192.168.10.25") is False
+
 
 def test_recent_private_servers_are_saved_without_duplicates(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
@@ -100,6 +106,14 @@ def test_recent_private_servers_are_saved_without_duplicates(tmp_path, monkeypat
         "http://gpu-pc:2468",
         "http://192.168.1.50:1234",
     ]
+
+
+def test_explicitly_approved_routable_server_is_remembered(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    model_discovery.remember_server("158.132.152.60", allow_public=True)
+
+    assert model_discovery.load_recent_servers() == ["http://158.132.152.60:1234"]
 
 
 def test_discovery_reports_authentication_and_offline(monkeypatch) -> None:
@@ -250,6 +264,32 @@ def test_manual_private_server_is_probed_without_local_binding_check(monkeypatch
     assert result.base_url == "http://192.168.5.8:5678"
     assert result.port == 5678
     assert requested == ["http://192.168.5.8:5678/api/v1/models"]
+
+
+def test_manual_routable_server_requires_opt_in_then_uses_default_port(monkeypatch) -> None:
+    payload = {
+        "models": [
+            loaded_model("qwen/qwen3-vl-8b", architecture="qwen3_vl"),
+            loaded_model("google/gemma-3-4b", architecture="gemma3", vision=True),
+        ]
+    }
+    requested: list[str] = []
+
+    def fake_get(url, **kwargs):
+        requested.append(url)
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: payload)
+
+    monkeypatch.setattr(model_discovery.httpx, "get", fake_get)
+
+    denied = model_discovery.discover_models(base_url="158.132.152.60")
+    allowed = model_discovery.discover_models(
+        base_url="158.132.152.60", allow_public=True
+    )
+
+    assert denied.status == "invalid_server"
+    assert allowed.status == "ready"
+    assert allowed.base_url == "http://158.132.152.60:1234"
+    assert requested == ["http://158.132.152.60:1234/api/v1/models"]
 
 
 def test_discovery_rejects_network_exposed_server(monkeypatch) -> None:

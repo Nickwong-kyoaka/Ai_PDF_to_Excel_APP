@@ -75,9 +75,14 @@ def test_automatic_balanced_mode_is_the_default() -> None:
     assert window.performance_combo.currentData() == "balanced"
     assert "no pauses" in window.run_mode_combo.currentText()
     assert window._selected_server_target() is None
+    assert window.allow_public_server.isChecked() is False
 
     window.server_combo.setEditText("192.168.1.80:1234")
     assert window._selected_server_target() == "192.168.1.80:1234"
+
+    window.server_combo.setEditText("http://158.132.152.60")
+    window.allow_public_server.setChecked(True)
+    assert window._selected_server_target() == "http://158.132.152.60"
 
     window.close()
     app.processEvents()

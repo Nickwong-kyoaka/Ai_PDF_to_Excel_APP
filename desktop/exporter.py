@@ -563,7 +563,7 @@ def write_series_excel(
         for item in items
     ]
     settings_rows = [
-        {"Setting": "FormSight_Version", "Value": "0.6.1"},
+        {"Setting": "FormSight_Version", "Value": "0.6.2"},
         {"Setting": "Processing_Mode", "Value": batch.processing_mode},
         {"Setting": "Automatic_Safe_Skip", "Value": not batch.review_groups},
         {"Setting": "Focus_Review_Selected", "Value": batch.review_focus},

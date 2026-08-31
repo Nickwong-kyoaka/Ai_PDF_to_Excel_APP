@@ -26,6 +26,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build-desktop.ps1
 
 The repeatable build creates a PyInstaller one-folder application, wraps it as `release\FormSight-Local-Setup.exe`, and creates a transfer-ready `release\FormSight-Local-v0.6.1-Transfer.zip`. The ZIP contains only the installer, a bilingual quick-start guide, and its SHA-256 checksum. If the installer already exists, `Package-FormSight-Transfer.bat` can rebuild the ZIP without recompiling the app. LM Studio remains responsible for GPU inference, so the desktop installer does not bundle model weights, CUDA libraries, or ONNX Runtime.
 
+For a no-install alternative, run `Build-FormSight-Portable.bat` to create the separate `release\FormSight-Local-Portable.exe`. It is one self-contained executable that can be copied directly to the GPU PC and launched without administrator rights or installation. On each launch, PyInstaller securely extracts its bundled runtime to the Windows temporary directory, so startup is slower than the installed one-folder edition. Questionnaire checkpoints and settings are not stored beside the EXE; they remain durable under `%LOCALAPPDATA%\FormSight Local`. LM Studio and the loaded models are still required.
+
 Questionnaire text and images are untrusted data. The model gateway explicitly refuses document-borne instructions, disables tool use, and accepts only schema-validated JSON. The web edition keeps LM Studio on `127.0.0.1`. The local edition accepts only loopback, private IP/VPN ranges, or local hostnames; if a remote HTTP server is selected, questionnaire images travel unencrypted inside that trusted LAN/VPN, so the LM Studio port must not be exposed to the public internet.
 
 ## What is implemented

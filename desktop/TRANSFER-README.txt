@@ -4,6 +4,9 @@ FormSight 本機版 — 目標電腦快速安裝
 This transfer package contains the Windows installer. Model files are not included.
 此傳輸套件包含 Windows 安裝程式，但不包含模型檔案。
 
+A separate FormSight-Local-Portable.exe release can be run directly without installation or administrator rights.
+另有獨立的 FormSight-Local-Portable.exe，可直接執行，不需安裝或管理員權限。
+
 DESTINATION PC / 目標電腦
 
 1. Install LM Studio 0.4 or newer.

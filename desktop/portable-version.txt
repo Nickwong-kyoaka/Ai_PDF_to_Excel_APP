@@ -1,0 +1,30 @@
+# UTF-8
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(0, 6, 1, 0),
+    prodvers=(0, 6, 1, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        u'040904B0',
+        [
+          StringStruct(u'CompanyName', u'FormSight'),
+          StringStruct(u'FileDescription', u'FormSight Local Portable'),
+          StringStruct(u'FileVersion', u'0.6.1'),
+          StringStruct(u'InternalName', u'FormSight-Local-Portable'),
+          StringStruct(u'OriginalFilename', u'FormSight-Local-Portable.exe'),
+          StringStruct(u'ProductName', u'FormSight Local'),
+          StringStruct(u'ProductVersion', u'0.6.1')
+        ]
+      )
+    ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
